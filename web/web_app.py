@@ -84,15 +84,16 @@ async def start_server(host: str = '0.0.0.0', port: int | None = None):
 # ============================================================================
 
 @ui.page('/main_app')
-@require_twa                 # Инициализация TWA и загрузка темы
-@with_theme_toggle           # Добавление переключателя темы
+@require_twa 
 @splash_screen(
-    svg_path='/spar_taxi_splash.svg',  # Ваш SVG файл
-    duration=2000,                            # Минимальное время показа
+    svg_path=None,                            # Ваш SVG файл
+    duration=3000,                            # Минимальное время показа
     fade_in=300,                              # Время появления
     fade_out=500,                             # Время исчезновения
     auto_hide=True                            # Автоматически скрыть
 )
+#@require_twa                 # Инициализация TWA и загрузка темы
+@with_theme_toggle           # Добавление переключателя темы
 async def main_app():
     """
     Главная страница Mini App с навигацией по вкладкам.

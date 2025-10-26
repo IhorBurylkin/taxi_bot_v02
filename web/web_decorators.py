@@ -373,44 +373,39 @@ def ensure_twa() -> None:
         c.storage['twa_sdk_added'] = True
         
     if not c.storage.get('theme_boot_added'):
-        ui.add_head_html('''
-        <script id="theme-boot">
+    # 1) pre-paint можно оставить как CSS в head (ui.add_head_html(...style...))
+    # 2) сам boot — запускать КОДОМ
+        ui.run_javascript(r"""
         (function(){
-          // --- PRE-PAINT: мгновенно красим фон ---
-          var ov=null; try{ ov = localStorage.getItem('theme_override'); }catch(_){}
+          // --- PRE-PAINT (как у вас): bg + color-scheme ---
+          var ov=null; try{ ov=localStorage.getItem('theme_override'); }catch(_){}
           var preferDark = ov ? (ov==='dark')
                               : (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
-          var preBg = preferDark ? '#0b0b0c' : '#ffffff';
-          
-          try{ document.documentElement.style.backgroundColor = preBg; }catch(_){}
-          try{ document.body.style.backgroundColor = preBg; }catch(_){}
-          try{ document.documentElement.style.setProperty('color-scheme', preferDark ? 'dark' : 'light'); }catch(_){}
-          try{ window.Telegram?.WebApp?.setBackgroundColor?.(preBg); }catch(_){}
-          
-          // ✅ НЕ скрываем body - пусть splash контролирует видимость
-          // try{ document.body.style.visibility = 'hidden'; }catch(_){}  // ← УДАЛИТЬ
-          
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          const deadline = performance.now() + 1200;
+          var desired = preferDark ? 'dark' : 'light';
+          var isDark = (desired==='dark');
 
-          async function getUserId(){ /* ... */ }
-          async function fetchTheme(uid){ /* ... */ }
+          try{
+            document.documentElement.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
+            document.body.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
+            document.documentElement.style.setProperty('color-scheme', isDark ? 'dark' : 'light');
+            // Применяем сразу классы и Quasar
+            document.body.classList.toggle('body--dark', isDark);
+            document.body.classList.toggle('body--light', !isDark);
+            window.Quasar?.Dark?.set?.(isDark);
+            // Телеграм фон
+            window.Telegram?.WebApp?.setBackgroundColor?.(isDark ? '#0b0b0c' : '#ffffff');
+          }catch(e){}
 
-          (async function boot(){
-            let desired = 'light';
-            let uid = await getUserId();
-            // ... остальная логика ...
-
-            // ✅ Снимаем вуаль и СИГНАЛИЗИРУЕМ о готовности
-            try{ document.getElementById('pre-theme-veil')?.remove(); }catch(_){}
-            // НЕ показываем body явно:
-            // try{ document.body.style.visibility = 'visible'; }catch(_){}  // ← УДАЛИТЬ
-            
+          // Попытка подтянуть user_id и тему из БД (если есть) — необязателен для «моментального» применения
+          (async () => {
+            // ... ваша логика получения uid и fetch('/api/theme?user_id=...') ...
+            // при ответе 'light'/'dark' — переустановить классы/Quasar/цвет
+          })().finally(() => {
             window.__THEME_BOOT_DONE = true;
-            window.dispatchEvent(new Event('theme:ready'));  // ← splash ждет этого события
-          })();
+            window.dispatchEvent(new Event('theme:ready'));
+          });
         })();
-        </script>''')
+        """)
         c.storage['theme_boot_added'] = True
 
 
