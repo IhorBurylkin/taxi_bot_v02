@@ -176,49 +176,40 @@ async def show_splash(
     """
     Показывает splash screen на весь экран
     
-    Args:
-        svg_content: SVG код
-        fade_in_ms: Время появления (мс)
-        fade_out_ms: Время исчезновения (мс)
-        z_index: Z-индекс overlay
-        
-    Returns:
-        (overlay_element, hide_function)
+    ВАЖНО: Не добавляет viewport meta (уже добавлен в require_twa)
     """
     
-    # Добавляем viewport meta-тег для мобильных устройств (если еще не добавлен)
-    ui.add_head_html('''
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    ''')
+    # ❌ УБРАТЬ ЭТО (уже есть в require_twa):
+    # ui.add_head_html('''<meta name="viewport"...>''')
     
-    # Создаём data URL для SVG
-    svg_data_url = 'data:image/svg+xml;charset=utf-8,' + url_quote(svg_content, safe='')
-    
-    # Создаём уникальный ID для overlay
     import uuid
     overlay_id = f'splash-{uuid.uuid4().hex[:8]}'
     
-    # Создаём overlay через HTML напрямую, чтобы избежать проблем с парсингом NiceGUI
+    from urllib.parse import quote as url_quote
+    svg_data_url = 'data:image/svg+xml;charset=utf-8,' + url_quote(svg_content, safe='')
+    
+    # ✅ ИСПРАВЛЕННЫЙ overlay с !important для независимости от body
     ui.add_body_html(f'''
         <div id="{overlay_id}" style="
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            width: 100vw;
-            height: 100vh;
-            height: calc(var(--vh, 1vh) * 100);
-            height: 100svh;
-            height: 100dvh;
-            z-index: {z_index};
-            background: linear-gradient(135deg, #0057B7 0%, #FFD500 100%);
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100svh !important;
+            height: 100dvh !important;
+            z-index: {z_index} !important;
+            background: linear-gradient(135deg, #0057B7 0%, #FFD500 100%) !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
             opacity: 0;
+            visibility: visible !important;  /* ← ВАЖНО: игнорируем body visibility */
             transition: opacity {fade_in_ms}ms ease-in-out;
-            overflow: hidden;
+            overflow: hidden !important;
+            pointer-events: auto !important;
         ">
             <div style="
                 width: 100%;
@@ -231,16 +222,25 @@ async def show_splash(
         </div>
     ''')
     
-    # Дополнительные настройки через JS
+    # ✅ ИСПРАВЛЕННАЯ JS инициализация с синхронизацией theme boot
     await ui.run_javascript(f'''
-        (function() {{
+        (async function() {{
             const overlay = document.getElementById('{overlay_id}');
             if (!overlay) return;
             
-            // Запрещаем скролл на время показа splash
+            // Запрещаем скролл
             document.body.style.overflow = 'hidden';
             
-            // Устанавливаем CSS-переменные для viewport height (для мобильных)
+            // ✅ Ждем готовности темы (если theme boot еще идет)
+            if (!window.__THEME_BOOT_DONE) {{
+                await new Promise(resolve => {{
+                    window.addEventListener('theme:ready', resolve, {{once: true}});
+                    // Timeout на случай если событие пропустили
+                    setTimeout(resolve, 500);
+                }});
+            }}
+            
+            // Устанавливаем CSS-переменные для viewport height
             function setViewportHeight() {{
                 const vh = window.innerHeight * 0.01;
                 document.documentElement.style.setProperty('--vh', `${{vh}}px`);
@@ -248,17 +248,15 @@ async def show_splash(
             setViewportHeight();
             window.addEventListener('resize', setViewportHeight);
             
-            // Плавное появление
-            setTimeout(() => {{
-                overlay.style.opacity = '1';
-            }}, 50);
+            // Плавное появление ПОСЛЕ theme boot
+            await new Promise(r => setTimeout(r, 50));
+            overlay.style.opacity = '1';
         }})();
     ''')
     
     async def hide():
         """Скрывает splash screen"""
         try:
-            # Плавное исчезновение
             await ui.run_javascript(f'''
                 const overlay = document.getElementById('{overlay_id}');
                 if (overlay) {{
@@ -267,16 +265,12 @@ async def show_splash(
                 }}
             ''')
             
-            # Ждём завершения анимации
             await asyncio.sleep(fade_out_ms / 1000 + 0.1)
             
-            # Возвращаем скролл и удаляем элемент
             await ui.run_javascript(f'''
                 document.body.style.overflow = '';
                 const overlay = document.getElementById('{overlay_id}');
-                if (overlay) {{
-                    overlay.remove();
-                }}
+                if (overlay) overlay.remove();
             ''')
             
         except Exception as e:
