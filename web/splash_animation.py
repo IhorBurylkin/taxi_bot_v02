@@ -1,23 +1,21 @@
 """
 Splash Screen Animation для NiceGUI Telegram WebApp
 
-Полноэкранный splash screen для красивой загрузки приложения.
+ИСПРАВЛЕННАЯ версия - правильно работает с декораторами require_twa и with_theme_toggle
 
-Возможности:
-- Плавные анимации появления/исчезновения
-- Поддержка пользовательских SVG
-- Адаптивная высота для всех мобильных устройств
-- Минимальное время показа (чтобы пользователь успел увидеть логотип)
-
-Примечание: Для открытия webapp на весь экран используйте ваш существующий код
-с Telegram.WebApp.expand() в основной функции страницы.
+Ключевые изменения:
+1. Splash показывается СРАЗУ, не дожидаясь theme:ready
+2. Основная функция страницы выполняется ПАРАЛЛЕЛЬНО с показом splash
+3. Splash скрывается после завершения инициализации и минимального времени показа
 
 Использование:
-
-@splash_screen(svg_path='/path/to/logo.svg', duration=2000)
-async def my_page():
-    # ваш код страницы
-    pass
+    @ui.page('/main_app')
+    @splash_screen(svg_path=None, duration=2000)  # Внешний декоратор
+    @require_twa                                   # Средний декоратор
+    @with_theme_toggle                             # Внутренний декоратор
+    async def main_app():
+        # ваш код страницы
+        pass
 """
 
 from __future__ import annotations
@@ -148,7 +146,7 @@ def _get_default_svg() -> str:
     <!-- Текст загрузки -->
     <text x="200" y="460" text-anchor="middle" font-size="12" 
           fill="white" opacity="0.8" font-family="Arial">
-      Завантаження...
+      Loading...
     </text>
   </g>
 </svg>'''
@@ -160,35 +158,36 @@ def _load_svg(svg_path: str | None) -> str:
         try:
             path = Path(svg_path)
             if path.exists() and path.is_file():
+                print(f"[SPLASH] Загружаю SVG из файла: {svg_path}")
                 return path.read_text(encoding='utf-8')
+            else:
+                print(f"[SPLASH] Файл не найден: {svg_path}, использую дефолтный SVG")
         except Exception as e:
-            print(f"Ошибка загрузки SVG: {e}")
+            print(f"[SPLASH] Ошибка загрузки SVG: {e}")
+    else:
+        print("[SPLASH] svg_path=None, использую дефолтный SVG")
     
     return _get_default_svg()
 
 
-async def show_splash(
+async def show_splash_immediate(
     svg_content: str,
     fade_in_ms: int = 300,
     fade_out_ms: int = 500,
-    z_index: int = 9999
+    z_index: int = 2147483000
 ) -> tuple:
     """
-    Показывает splash screen на весь экран
+    Показывает splash screen СРАЗУ, не дожидаясь theme:ready
     
-    ВАЖНО: Не добавляет viewport meta (уже добавлен в require_twa)
+    КЛЮЧЕВОЕ ОТЛИЧИЕ: не ждет события theme:ready, показывает splash немедленно
     """
-    
-    # ❌ УБРАТЬ ЭТО (уже есть в require_twa):
-    # ui.add_head_html('''<meta name="viewport"...>''')
     
     import uuid
     overlay_id = f'splash-{uuid.uuid4().hex[:8]}'
     
-    from urllib.parse import quote as url_quote
     svg_data_url = 'data:image/svg+xml;charset=utf-8,' + url_quote(svg_content, safe='')
     
-    # ✅ ИСПРАВЛЕННЫЙ overlay с !important для независимости от body
+    # Добавляем overlay с максимальным приоритетом
     ui.add_body_html(f'''
         <div id="{overlay_id}" style="
             position: fixed !important;
@@ -206,7 +205,7 @@ async def show_splash(
             align-items: center !important;
             justify-content: center !important;
             opacity: 0;
-            visibility: visible !important;  /* ← ВАЖНО: игнорируем body visibility */
+            visibility: visible !important;
             transition: opacity {fade_in_ms}ms ease-in-out;
             overflow: hidden !important;
             pointer-events: auto !important;
@@ -214,7 +213,7 @@ async def show_splash(
             <div style="
                 width: 100%;
                 height: 100%;
-                background-image: url({svg_data_url});
+                background-image: url('{svg_data_url}');
                 background-size: contain;
                 background-position: center;
                 background-repeat: no-repeat;
@@ -222,23 +221,20 @@ async def show_splash(
         </div>
     ''')
     
-    # ✅ ИСПРАВЛЕННАЯ JS инициализация с синхронизацией theme boot
+    # УПРОЩЕННЫЙ JavaScript - показываем СРАЗУ, без ожидания theme:ready
     await ui.run_javascript(f'''
         (async function() {{
-            const overlay = document.getElementById('{overlay_id}');
-            if (!overlay) return;
+            console.log('[SPLASH] Немедленная инициализация splash screen ID: {overlay_id}');
             
+            const overlay = document.getElementById('{overlay_id}');
+            if (!overlay) {{
+                console.error('[SPLASH] Overlay не найден!');
+                return;
+            }}
+            
+            console.log('[SPLASH] Overlay найден, запрещаем скролл');
             // Запрещаем скролл
             document.body.style.overflow = 'hidden';
-            
-            // ✅ Ждем готовности темы (если theme boot еще идет)
-            if (!window.__THEME_BOOT_DONE) {{
-                await new Promise(resolve => {{
-                    window.addEventListener('theme:ready', resolve, {{once: true}});
-                    // Timeout на случай если событие пропустили
-                    setTimeout(resolve, 500);
-                }});
-            }}
             
             // Устанавливаем CSS-переменные для viewport height
             function setViewportHeight() {{
@@ -248,33 +244,48 @@ async def show_splash(
             setViewportHeight();
             window.addEventListener('resize', setViewportHeight);
             
-            // Плавное появление ПОСЛЕ theme boot
-            await new Promise(r => setTimeout(r, 50));
+            // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: показываем СРАЗУ, без ожидания
+            console.log('[SPLASH] Показываем splash немедленно...');
+            await new Promise(r => setTimeout(r, 10));  // Минимальная задержка для отрисовки DOM
             overlay.style.opacity = '1';
+            console.log('[SPLASH] Splash отображён, opacity=1');
         }})();
     ''')
     
     async def hide():
         """Скрывает splash screen"""
         try:
+            print(f"[SPLASH] Начинаем скрывать splash {overlay_id}")
+            
             await ui.run_javascript(f'''
+                console.log('[SPLASH] Скрываем overlay...');
                 const overlay = document.getElementById('{overlay_id}');
                 if (overlay) {{
                     overlay.style.opacity = '0';
                     overlay.style.pointerEvents = 'none';
+                    console.log('[SPLASH] Opacity установлена в 0');
+                }} else {{
+                    console.error('[SPLASH] Overlay не найден при скрытии');
                 }}
             ''')
             
+            # Ждём завершения анимации
             await asyncio.sleep(fade_out_ms / 1000 + 0.1)
             
             await ui.run_javascript(f'''
+                console.log('[SPLASH] Удаляем overlay и возвращаем скролл');
                 document.body.style.overflow = '';
                 const overlay = document.getElementById('{overlay_id}');
-                if (overlay) overlay.remove();
+                if (overlay) {{
+                    overlay.remove();
+                    console.log('[SPLASH] Overlay удалён');
+                }}
             ''')
             
+            print(f"[SPLASH] Splash {overlay_id} успешно скрыт и удалён")
+            
         except Exception as e:
-            print(f"Ошибка при скрытии splash: {e}")
+            print(f"[SPLASH] Ошибка при скрытии splash: {e}")
     
     return overlay_id, hide
 
@@ -287,7 +298,12 @@ def splash_screen(
     auto_hide: bool = True
 ):
     """
-    Декоратор для добавления splash screen к странице NiceGUI
+    ИСПРАВЛЕННЫЙ декоратор для добавления splash screen к странице NiceGUI
+    
+    Правильно работает с декораторами require_twa и with_theme_toggle:
+    - Показывает splash СРАЗУ
+    - Запускает основную функцию ПАРАЛЛЕЛЬНО (которая инициализирует theme boot)
+    - Скрывает splash после минимального времени показа
     
     Args:
         svg_path: Путь к SVG файлу (если None - используется дефолтный)
@@ -296,44 +312,67 @@ def splash_screen(
         fade_out: Время исчезновения (мс)
         auto_hide: Автоматически скрывать после загрузки страницы
         
-    Пример использования:
-        @ui.page('/')
-        @splash_screen(svg_path='./logo.svg', duration=2000)
-        async def index():
-            ui.label('Главная страница')
+    Правильный порядок декораторов:
+        @ui.page('/main_app')
+        @splash_screen(duration=2000)    # Внешний - выполняется последним
+        @require_twa                      # Средний
+        @with_theme_toggle                # Внутренний - выполняется первым
+        async def main_app():
+            ...
     """
     
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            # Загружаем SVG
-            svg_content = _load_svg(svg_path)
+            print(f"[SPLASH] Декоратор splash_screen вызван для {func.__name__}")
+            print(f"[SPLASH] Параметры: svg_path={svg_path}, duration={duration}, fade_in={fade_in}, fade_out={fade_out}")
             
-            # Показываем splash
-            overlay_id, hide = await show_splash(
+            # 1. Загружаем SVG
+            svg_content = _load_svg(svg_path)
+            print(f"[SPLASH] SVG загружен, длина: {len(svg_content)} символов")
+            
+            # 2. Показываем splash НЕМЕДЛЕННО
+            print("[SPLASH] Показываем splash немедленно...")
+            overlay_id, hide = await show_splash_immediate(
                 svg_content=svg_content,
                 fade_in_ms=fade_in,
                 fade_out_ms=fade_out
             )
+            print(f"[SPLASH] Splash показан, overlay_id={overlay_id}")
+            
+            # 3. Засекаем время начала
+            import time
+            start_time = time.time()
             
             try:
-                # Запускаем основную функцию страницы
+                # 4. ПАРАЛЛЕЛЬНО запускаем основную функцию страницы
+                #    (она выполнит require_twa, with_theme_toggle и остальную инициализацию)
+                print(f"[SPLASH] Запускаем основную функцию {func.__name__} параллельно...")
                 result = await func(*args, **kwargs)
+                print(f"[SPLASH] Основная функция {func.__name__} завершена")
                 
                 if auto_hide:
-                    # Ждём минимальное время показа
-                    await asyncio.sleep(duration / 1000)
+                    # 5. Вычисляем оставшееся время до минимального duration
+                    elapsed_ms = (time.time() - start_time) * 1000
+                    remaining_ms = max(0, duration - elapsed_ms)
                     
-                    # Скрываем splash
+                    if remaining_ms > 0:
+                        print(f"[SPLASH] Ждём ещё {remaining_ms:.0f}ms до минимального времени показа...")
+                        await asyncio.sleep(remaining_ms / 1000)
+                    
+                    # 6. Скрываем splash
+                    print("[SPLASH] Скрываем splash...")
                     await hide()
+                    print("[SPLASH] Splash скрыт")
                 
                 return result
                 
             except Exception as e:
                 # В случае ошибки тоже скрываем splash
+                print(f"[SPLASH] ОШИБКА в основной функции: {e}")
                 if auto_hide:
                     await hide()
-                raise e
+                raise
         
         return wrapper
     return decorator
@@ -344,57 +383,59 @@ def splash_screen(
 # ============================================================================
 
 if __name__ == '__main__':
-    from nicegui import app
+    """
+    Демонстрация правильного порядка декораторов
+    """
     
-    # Пример 1: Базовое использование с дефолтным SVG
+    # Симуляция декораторов require_twa и with_theme_toggle
+    def mock_require_twa(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            print("[MOCK] require_twa: инициализация TWA...")
+            await asyncio.sleep(0.3)  # Симуляция инициализации
+            result = await fn(*args, **kwargs)
+            print("[MOCK] require_twa: завершено")
+            return result
+        return wrapper
+    
+    def mock_with_theme_toggle(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            print("[MOCK] with_theme_toggle: добавление переключателя темы...")
+            await asyncio.sleep(0.2)  # Симуляция добавления UI
+            result = await fn(*args, **kwargs)
+            print("[MOCK] with_theme_toggle: завершено")
+            return result
+        return wrapper
+    
+    # Правильный порядок
     @ui.page('/')
-    @splash_screen(duration=2000)
+    @splash_screen(svg_path=None, duration=2000, fade_in=300, fade_out=500)
+    @mock_require_twa
+    @mock_with_theme_toggle
     async def index():
-        # Ваш код для открытия webapp на весь экран (если нужно)
-        await ui.run_javascript('''
-            try{
-                const tg = window.Telegram?.WebApp;
-                tg?.ready?.();
-                tg?.expand?.();
-                tg?.disableVerticalSwipes?.();
-            }catch(e){}
-        ''', timeout=3.0)
+        print("[PAGE] Рендеринг основной страницы...")
+        await asyncio.sleep(0.5)  # Симуляция загрузки данных
         
         ui.label('Главная страница SPAR-TAXI').classes('text-h4')
         ui.label('Добро пожаловать!').classes('text-subtitle1')
         
         with ui.card():
             ui.label('Контент загружен')
+        
+        print("[PAGE] Рендеринг завершен")
     
-    
-    # Пример 2: С пользовательским SVG
-    @ui.page('/custom')
-    @splash_screen(
-        svg_path='/path/to/custom.svg',
-        duration=2000,
-        fade_in=500,
-        fade_out=800
-    )
-    async def custom_page():
-        ui.label('Страница с кастомным splash').classes('text-h4')
-    
-    
-    # Пример 3: Интеграция с существующими декораторами
-    # @ui.page('/main_app')
-    # @splash_screen(svg_path='/mnt/data/spar_taxi_splash.svg', duration=2000)
-    # @require_twa
-    # @with_theme_toggle
-    # async def main_app():
-    #     await ui.run_javascript('''
-    #         try{
-    #             const tg = window.Telegram?.WebApp;
-    #             tg?.ready?.();
-    #             tg?.expand?.();
-    #             tg?.disableVerticalSwipes?.();
-    #         }catch(e){}
-    #     ''', timeout=3.0)
-    #     
-    #     # ваш код страницы...
-    
+    print("\n" + "="*80)
+    print("ДЕМОНСТРАЦИЯ: Правильный порядок декораторов")
+    print("="*80)
+    print("\nПорядок выполнения (изнутри наружу):")
+    print("1. mock_with_theme_toggle - выполняется первым")
+    print("2. mock_require_twa - выполняется вторым")
+    print("3. splash_screen - выполняется последним")
+    print("\nРезультат:")
+    print("- Splash показывается СРАЗУ")
+    print("- Инициализация идет ПАРАЛЛЕЛЬНО")
+    print("- Splash скрывается после минимального времени")
+    print("="*80 + "\n")
     
     ui.run(port=8080)
