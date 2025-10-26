@@ -1,0 +1,15 @@
+,gitignore
+config/lang_dict.json
+config/config.json
+log/logs.log
+*.pyc
+*.py[cod]
+*.log
+*.json
+.env
+__pycache__/
+*.svg
+*.png
+*.jpg
+*.jpeg
+*.gif
