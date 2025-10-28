@@ -86,6 +86,7 @@ TABLES_SCHEMAS = {
         "car_number": "VARCHAR(20)",
         "car_image": "TEXT",
         "techpass_image": "TEXT",
+        "driver_license": "TEXT",
         "rating_driver": "NUMERIC(3,2)",
         "trips_count_driver": "JSONB",
         "is_working": "BOOLEAN DEFAULT TRUE",

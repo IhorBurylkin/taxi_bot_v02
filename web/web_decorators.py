@@ -8,6 +8,7 @@ from functools import wraps
 from db.db_utils import update_table, get_user_theme, user_exists, insert_into_table, get_user_data 
 from config.config_utils import lang_dict
 from config.config import SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES
+from log.log import log_info
 
 SDK_SRC = 'https://telegram.org/js/telegram-web-app.js'
 
@@ -392,69 +393,6 @@ def ensure_twa() -> None:
     
     # Шаг 2-8: Boot-скрипт загружается один раз    
     if not c.storage.get('theme_boot_added'):
-<<<<<<< HEAD
-        ui.run_javascript(r"""
-        (function(){
-          // PRE-PAINT: Устанавливаем фон ДО первого рендера
-          // Это предотвращает белую вспышку на тёмной теме
-          var ov=null; 
-          try { 
-            ov=localStorage.getItem('theme_override'); 
-          } catch(_) {}
-          
-          // Определяем желаемую тему
-          var preferDark = ov ? (ov==='dark')
-                              : (window.matchMedia && 
-                                 matchMedia('(prefers-color-scheme: dark)').matches);
-          var desired = preferDark ? 'dark' : 'light';
-          var isDark = (desired==='dark');
-
-          try {
-            // Применяем цвета немедленно
-            document.documentElement.style.backgroundColor = 
-              isDark ? '#0b0b0c' : '#ffffff';
-            document.body.style.backgroundColor = 
-              isDark ? '#0b0b0c' : '#ffffff';
-            document.documentElement.style.setProperty(
-              'color-scheme', 
-              isDark ? 'dark' : 'light'
-            );
-            
-            // Синхронизируем классы и Quasar
-            document.body.classList.toggle('body--dark', isDark);
-            document.body.classList.toggle('body--light', !isDark);
-            window.Quasar?.Dark?.set?.(isDark);
-            
-            // Телеграм фон
-            window.Telegram?.WebApp?.setBackgroundColor?.(
-              isDark ? '#0b0b0c' : '#ffffff'
-            );
-          } catch(e) {
-            console.error('[ensure_twa] Pre-paint failed:', e);
-          }
-
-          // Асинхронная загрузка темы из БД (не блокирует рендер)
-          (async () => {
-            try {
-              const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id;
-              if (uid) {
-                const resp = await fetch(`/api/theme?user_id=${uid}`);
-                const data = await resp.json();
-                if (data.theme && data.theme !== desired) {
-                  // Применяем тему из БД, если отличается
-                  const dbIsDark = (data.theme === 'dark');
-                  document.body.classList.toggle('body--dark', dbIsDark);
-                  document.body.classList.toggle('body--light', !dbIsDark);
-                  window.Quasar?.Dark?.set?.(dbIsDark);
-                  // ... (остальная синхронизация)
-                }
-              }
-            } catch(e) {
-              console.warn('[ensure_twa] DB theme load failed:', e);
-            }
-          })().finally(() => {
-            // Сигнализируем готовность темы
-=======
     # 1) pre-paint можно оставить как CSS в head (ui.add_head_html(...style...))
     # 2) сам boot — запускать КОДОМ
         ui.run_javascript(r"""
@@ -483,7 +421,6 @@ def ensure_twa() -> None:
             // ... ваша логика получения uid и fetch('/api/theme?user_id=...') ...
             // при ответе 'light'/'dark' — переустановить классы/Quasar/цвет
           })().finally(() => {
->>>>>>> 1b9d460f37ca78897db96c09acd32a2a41eb3aba
             window.__THEME_BOOT_DONE = true;
             window.dispatchEvent(new Event('theme:ready'));
           });
@@ -505,80 +442,44 @@ def require_twa(fn):
     return wrapper
 
 
-def with_theme_toggle(fn):
-    """Декоратор для добавления переключателя темы"""
-    @functools.wraps(fn)
-    async def wrapper(*args, **kwargs):
-        _ensure_theme_assets_once()
-        user_lang = await _resolve_user_lang()
-        _add_theme_toggle_ui(user_lang)
-        return await fn(*args, **kwargs)
-    return wrapper
-
-
-def with_svg_splash_img(
-    *,
-    svg_path: str | None = None,
-    fade_ms: int = 500,
-    z_index: int = 2_147_483_000,
-    auto_hide: bool = True,
-    hide_delay_ms: int = 100,
-):
-    """Декоратор для отображения splash screen"""
+def on_toggle(render_toggle: bool = True):
+    """
+    Управляет добавлением UI-переключателя темы.
+    True  → всё как раньше: стили/boot + сам тумблер
+    False → стили/boot остаются, НО сам тумблер не рендерится
+    """
     def _decorator(fn):
-        @wraps(fn)
-        async def _wrapped(*args, **kwargs):
-            from web.web_utilits import get_spar_taxi_splash_svg, show_startup_splash_img_min
-            
-            # Показать splash
-            svg = get_spar_taxi_splash_svg(svg_path)
-            overlay, hide = show_startup_splash_img_min(
-                svg, 
-                fade_ms=fade_ms, 
-                z_index=z_index
-            )
-            
-            # Убедиться, что overlay находится на верхнем уровне DOM
-            ov_id = overlay.id
-            ui.run_javascript(f"""
-(async () => {{
-  // Небольшая задержка, чтобы DOM успел отрендериться
-  await new Promise(r => setTimeout(r, 10));
-  
-  const el = document.querySelector('[data-id="{ov_id}"]');
-  if (!el) return;
-  
-  // Переместить в body, если не там
-  if (el.parentNode !== document.body) {{
-    document.body.appendChild(el);
-  }}
-  
-  // Гарантировать правильное позиционирование
-  Object.assign(el.style, {{
-    position: 'fixed',
-    top: '0',
-    left: '0',
-    right: '0',
-    bottom: '0',
-    margin: '0',
-    padding: '0',
-    transform: 'none',
-    WebkitTransform: 'none',
-    opacity: '1',
-    pointerEvents: 'auto'
-  }});
-}})();
-""")
-            
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
             try:
-                # Выполнить основную функцию страницы
-                result = await fn(*args, **kwargs)
-            finally:
-                # Скрыть splash
-                if auto_hide:
-                    await asyncio.sleep(hide_delay_ms / 1000)
-                    await hide()
-            
-            return result
-        return _wrapped
+                _ensure_theme_assets_once()
+                # язык всё равно резолвим — может пригодиться в самом view
+                user_lang = await _resolve_user_lang()
+                if render_toggle:
+                    _add_theme_toggle_ui(user_lang)
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                # Логировать по правилам проекта
+                try:
+                    await log_info(f"on_toggle wrapper failed: {e}", type_msg="error")
+                except Exception:
+                    pass
+                raise
+        return wrapper
     return _decorator
+
+
+def with_theme_toggle(arg=None):
+    """
+    Обратная совместимость и «сахар»:
+      @with_theme_toggle            → рендерим тумблер (по умолчанию)
+      @with_theme_toggle(False)     → не рендерим тумблер
+      @with_theme_toggle(True)      → рендерим тумблер
+    """
+    # форма @with_theme_toggle
+    if callable(arg):
+        return on_toggle(True)(arg)
+
+    # форма @with_theme_toggle(False/True) или без аргумента
+    render_toggle = True if arg is None else bool(arg)
+    return on_toggle(render_toggle)

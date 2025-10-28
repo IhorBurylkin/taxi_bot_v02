@@ -14,7 +14,7 @@ from log.log import log_info, send_info_msg
 finish_lock = asyncio.Lock()
 
 
-async def start_reg_form_ui(uid, user_lang, user_data) -> None:
+async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
     await ui.run_javascript('''
         try{
         const tg = window.Telegram?.WebApp;
@@ -30,20 +30,21 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
     cities = await load_cities()
     COUNTRY_CHOICES = await load_country_choices()
     model = {
-        'role': None, 'city': None,
+        'role': 'driver' if not choice_role else None,
+        'city': None,
         'phone_passenger': None, 'phone_driver': None,
         'car_brand': None, 'car_model': None, 'car_color': None, 'car_number': None,
-        'car_image': None, 'techpass_image': None,
+        'car_image': None, 'techpass_image': None, 'driver_license': None,
     }
 
     async def _on_submit_driver_form(e):
         # если нужно — здесь обновляете вашу модель/БД
         ui.notify(lang_dict('notify_ok_data', user_lang), type='positive')
 
-    with ui.element('div').classes('w-full min-h-[calc(var(--vh,1vh)*100)]') as page_root:
+    with ui.element('div').classes('w-full min-h-[calc(var(--vh,1vh)*100)] mx-auto px-4 md:px-4') as page_root:
         #with ui.scroll_area().classes('vscroll'):
             with ui.column().classes('w-full page-center q-gutter-y-md'):  # ← центр и только горизонтальные поля
-                ui.label(lang_dict('title_registration', user_lang)).classes('text-2xl font-bold q-mt-md q-ma-none q-pa-none')
+                ui.label(lang_dict('title_registration', user_lang)).classes('text-2xl font-bold gap-2 q-ma-none q-mt-lg q-pa-none')
                 with ui.stepper().props('vertical').classes('w-full q-pa-none q-ma-none') as st:
                     # 1) Роль
                     with ui.step(lang_dict('step_role', user_lang)).props('name=role').classes('w-full q-pa-none q-ma-none'):
@@ -283,7 +284,43 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                                     )
 
 
-                    # 4) Авто (только для водителя)
+                    # 4) Водительское удостоверение (только для водителя)
+                    with ui.step(lang_dict('step_driver_license', user_lang)).props('name=driver_license').classes('w-full q-pa-none q-ma-none') as step_driver_license:
+                        license_ok = {'img': False}
+
+                        async def _submit_license(_):
+                            if license_ok['img']:
+                                st.next()
+                            else:
+                                await ui.run_javascript("document.activeElement && document.activeElement.blur()")
+
+                        with ui.element('div').classes('w-full q-gutter-y-md'):
+                            ui.label(lang_dict('upload_driver_license_hint', user_lang)).classes('text-sm text-warning')
+                            
+                            with ui.row().classes('items-center w-full q-gutter-y-md gap-2'):
+                                up_license = ui.upload(label=lang_dict('upload_driver_license_label', user_lang)).props('accept="image/*" auto-upload').classes('w-full')
+
+                            with ui.stepper_navigation().classes('w-full q-gutter-y-md q-pa-none q-ma-none'):
+                                ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
+                                next_license = ui.button(lang_dict('btn_next', user_lang), on_click=_submit_license)
+                                next_license.disable()
+
+                        async def on_license_upload(e):
+                            try:
+                                model['driver_license'] = await _save_upload(uid, e, 'driver_license')
+                                license_ok['img'] = True
+                                ui.notify(lang_dict('upload_driver_license_success', user_lang))
+                                next_license.enable()
+                            except Exception as ex:
+                                license_ok['img'] = False
+                                next_license.disable()
+                                ui.notify(f'{lang_dict("upload_error_prefix", user_lang)}: {ex}', type='negative')
+
+                        up_license.on_upload(on_license_upload)
+                    step_driver_license.visible = False
+
+
+                    # 5) Авто (только для водителя)
                     with ui.step(lang_dict('step_car', user_lang)).props('name=car').classes('w-full q-pa-none q-ma-none') as step_car:
                         car_ok = {'img': False}
 
@@ -342,7 +379,7 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                     step_car.visible = False
 
 
-                    # 5) Госномер + техпаспорт (водитель)
+                    # 6) Госномер + техпаспорт (водитель)
                     with ui.step(lang_dict('step_docs', user_lang)).props('name=docs').classes('w-full q-pa-none q-ma-none') as step_docs:
                         tp_ok = {'img': False}
 
@@ -390,7 +427,7 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                                     'country': model['country'], 'region': model['region'], 'city': model['city'],
                                     'phone_driver': model['phone_driver'], 'phone_passenger': model['phone_driver'],
                                     'car_brand': model['car_brand'], 'car_model': model['car_model'], 'car_color': model['car_color'], 'car_number': model['car_number'],
-                                    'car_image': model['car_image'], 'techpass_image': model['techpass_image'],
+                                    'car_image': model['car_image'], 'techpass_image': model['techpass_image'], 'driver_license': model['driver_license'],
                                 }
                                 if await user_exists(uid):
                                     await update_table('users', uid, data)
@@ -410,12 +447,12 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                                     f'Car: {data["car_brand"]} {data["car_model"]} {data["car_color"]} {data["car_number"]}'
                                 )
 
-                                await send_info_msg(photo=[model['car_image'], model['techpass_image']], type_msg_tg="new_users", caption=f"Документы водителя {uid}")
-                                await send_info_msg(text=caption, type_msg_tg="new_users", reply_markup=verification_inline_kb())
-
                                 ui.notify(lang_dict('notify_verification', user_lang), type='warning', position='center')
                                 await log_info(f"[verify_driver] notify_user uid={uid}", type_msg="info")
                                 ui.timer(5.0, lambda: ui.navigate.to('/main_app?tab=main'), once=True)
+
+                                await send_info_msg(photo=[model['car_image'], model['techpass_image'], model['driver_license']], type_msg_tg="new_users", caption=f"Документы водителя {uid}")
+                                await send_info_msg(text=caption, type_msg_tg="new_users", reply_markup=verification_inline_kb())
                                 return
                 
                         up_tp.on_upload(on_tp_upload)
@@ -426,12 +463,18 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                     is_driver = (model.get('role') == 'driver')
                     step_city.visible  = True
                     step_phone.visible = True
+                    step_driver_license.visible = is_driver
                     step_car.visible   = is_driver
                     step_docs.visible  = is_driver
                     st.next()  # перейти к шагу "Город"
 
-                next1.on_click(_reveal_and_next)
-                st.set_value('role')
+                if choice_role:
+                    next1.on_click(_reveal_and_next)
+                    st.set_value('role')
+                else:
+                    # Автоматически раскрываем шаги для водителя и переходим к городу
+                    _reveal_and_next(None)
+                    st.set_value('city')
 
                 def _on_step_change(e):
                     val = getattr(e, 'value', None)

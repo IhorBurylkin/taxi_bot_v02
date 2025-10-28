@@ -6,7 +6,7 @@ import os
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi import FastAPI
 from nicegui import ui, app, storage
-from web.web_decorators import require_twa, with_theme_toggle, with_svg_splash_img
+from web.web_decorators import require_twa, with_theme_toggle
 from web.web_start_reg_form import start_reg_form_ui
 from web.web_utilits import get_user_data_uid_lang
 from web.splash.splash_animation import splash_screen
@@ -84,7 +84,7 @@ async def start_server(host: str = '0.0.0.0', port: int | None = None):
 # ============================================================================
 
 @ui.page('/main_app')
-@require_twa 
+@require_twa                 # Инициализация TWA и загрузка темы
 @splash_screen(
     svg_path=None,                            # Ваш SVG файл
     duration=3000,                            # Минимальное время показа
@@ -92,8 +92,7 @@ async def start_server(host: str = '0.0.0.0', port: int | None = None):
     fade_out=500,                             # Время исчезновения
     auto_hide=True                            # Автоматически скрыть
 )
-#@require_twa                 # Инициализация TWA и загрузка темы
-@with_theme_toggle           # Добавление переключателя темы
+@with_theme_toggle(False)          # Добавление переключателя темы
 async def main_app():
     """
     Главная страница Mini App с навигацией по вкладкам.
@@ -164,7 +163,7 @@ async def main_app():
 
                 # Панель: Регистрация (скрытая, без кнопки в футере)
                 with ui.tab_panel('start_reg_form'):
-                    await start_reg_form_ui(uid, user_lang, user_data)
+                    await start_reg_form_ui(uid, user_lang, user_data, choice_role=False)
 
         # ====================================================================
         # UI: Футер с навигацией
@@ -229,6 +228,41 @@ async def main_app():
     except Exception as e:
         await log_info(
             f"[page:/main_app][ОШИБКА] {e!r}", 
+            type_msg="error"
+        )
+        raise
+
+
+# ============================================================================
+# Страница регистрации (отдельная)
+# ============================================================================
+@ui.page('/start_reg_form')
+@require_twa
+@splash_screen(
+    svg_path=None,                            # Ваш SVG файл
+    duration=3000,                            # Минимальное время показа
+    fade_in=300,                              # Время появления
+    fade_out=500,                             # Время исчезновения
+    auto_hide=True                            # Автоматически скрыть
+)
+@with_theme_toggle(True)           # Добавление переключателя темы
+async def reg_form_page():  
+    """Страница регистрации пользователя."""
+    try:
+        await log_info("[page:/start_reg_form] рендер начат", type_msg="info")
+
+        # Получение данных пользователя
+        uid, user_lang, user_data = await get_user_data_uid_lang()
+        user_lang = user_lang or 'en'
+
+        # UI: Форма регистрации
+        await start_reg_form_ui(uid, user_lang, user_data, choice_role=True)
+
+        await log_info("[page:/start_reg_form] рендер завершён", type_msg="info")
+
+    except Exception as e:
+        await log_info(
+            f"[page:/start_reg_form][ОШИБКА] {e!r}", 
             type_msg="error"
         )
         raise

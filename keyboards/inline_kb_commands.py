@@ -11,7 +11,7 @@ def get_start_inline_kb(lang: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text=lang_dict('start_reg_form', lang),
-            web_app=WebAppInfo(url=f"{_BASE}/main_app?tab=start_reg_form"),  # <-- ВАЖНО: web_app вместо url
+            web_app=WebAppInfo(url=f"{_BASE}/start_reg_form"),  # <-- ВАЖНО: web_app вместо url
         )
     ]])
 
