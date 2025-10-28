@@ -392,6 +392,7 @@ def ensure_twa() -> None:
     
     # Шаг 2-8: Boot-скрипт загружается один раз    
     if not c.storage.get('theme_boot_added'):
+<<<<<<< HEAD
         ui.run_javascript(r"""
         (function(){
           // PRE-PAINT: Устанавливаем фон ДО первого рендера
@@ -453,6 +454,36 @@ def ensure_twa() -> None:
             }
           })().finally(() => {
             // Сигнализируем готовность темы
+=======
+    # 1) pre-paint можно оставить как CSS в head (ui.add_head_html(...style...))
+    # 2) сам boot — запускать КОДОМ
+        ui.run_javascript(r"""
+        (function(){
+          // --- PRE-PAINT (как у вас): bg + color-scheme ---
+          var ov=null; try{ ov=localStorage.getItem('theme_override'); }catch(_){}
+          var preferDark = ov ? (ov==='dark')
+                              : (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+          var desired = preferDark ? 'dark' : 'light';
+          var isDark = (desired==='dark');
+
+          try{
+            document.documentElement.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
+            document.body.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
+            document.documentElement.style.setProperty('color-scheme', isDark ? 'dark' : 'light');
+            // Применяем сразу классы и Quasar
+            document.body.classList.toggle('body--dark', isDark);
+            document.body.classList.toggle('body--light', !isDark);
+            window.Quasar?.Dark?.set?.(isDark);
+            // Телеграм фон
+            window.Telegram?.WebApp?.setBackgroundColor?.(isDark ? '#0b0b0c' : '#ffffff');
+          }catch(e){}
+
+          // Попытка подтянуть user_id и тему из БД (если есть) — необязателен для «моментального» применения
+          (async () => {
+            // ... ваша логика получения uid и fetch('/api/theme?user_id=...') ...
+            // при ответе 'light'/'dark' — переустановить классы/Quasar/цвет
+          })().finally(() => {
+>>>>>>> 1b9d460f37ca78897db96c09acd32a2a41eb3aba
             window.__THEME_BOOT_DONE = true;
             window.dispatchEvent(new Event('theme:ready'));
           });
