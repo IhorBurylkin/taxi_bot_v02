@@ -1,11 +1,25 @@
-# db/db_table_init.py
-
 import asyncpg
 import asyncio
 from log.log import log_info
 from config.config import DB_DSN, TABLES_SCHEMAS
+from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime
 
 _pool = None
+
+@dataclass
+class PoolStats:
+    """Статистика connection pool"""
+    timestamp: datetime
+    size: int              # Текущий размер пула (созданные соединения)
+    idle: int              # Простаивающих соединений
+    busy: int              # Активных соединений (size - idle)
+    min_size: int          # Минимум
+    max_size: int          # Максимум
+    available: int         # Резерв для роста (max_size - size)
+    busy_pct: float        # % занятых от созданных (0-100)
+    capacity_pct: float    # % использованной ёмкости от max_size (0-100)
 
 async def create_pool():
     global _pool
@@ -128,3 +142,91 @@ async def init_db_tables():
     finally:
         if connection:
             await release_connection(connection)
+
+async def get_pool_stats() -> Optional[PoolStats]:
+    """
+    Получить статистику пула для мониторинга.
+
+    Возвращает:
+        PoolStats: если пул инициализирован.
+        None: если пул не инициализирован.
+    """
+    global _pool
+    if not _pool:
+        return None
+    
+    size = _pool.get_size()          # Созданные соединения
+    idle = _pool.get_idle_size()     # Простаивающие
+    min_size = _pool.get_min_size()
+    max_size = _pool.get_max_size()
+    
+    busy = idle                           # Активные
+    available = max_size - size                  # Резерв роста
+    busy_pct = (busy / max_size * 100) if size > 0 else 0        # % занятых
+    capacity_pct = (size / max_size * 100) if max_size > 0 else 0  # % ёмкости
+    
+    return PoolStats(
+        timestamp=datetime.now(),
+        size=size,
+        idle=idle,
+        busy=busy,
+        min_size=min_size,
+        max_size=max_size,
+        available=available,
+        busy_pct=round(busy_pct, 1),
+        capacity_pct=round(capacity_pct, 1)
+    )
+
+
+async def monitor_pool_health():
+    """
+    Фоновая задача для мониторинга здоровья пула.
+    Запускать в main.py как asyncio.create_task()
+    """
+    previous_stats = 0
+
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            stats = await get_pool_stats()
+            if not stats:
+                continue
+            
+            async def log_info_pool():  
+                await log_info(
+                    f"[pool] size={stats.size}/{stats.max_size} "
+                    f"(idle={stats.idle}, available={stats.available}) | "
+                    f"busy={stats.busy_pct}%",
+                    type_msg="info"
+                )  
+
+
+            changed = stats.busy_pct != previous_stats
+
+            if changed:
+                if stats.busy_pct >= 10 or stats.busy_pct == 0:
+                    await log_info_pool()
+
+                if 80 <= stats.busy_pct < 90:
+                    await log_info(
+                        f"⚠️ [pool] ВЫСОКАЯ ЗАНЯТОСТЬ: {stats.busy_pct}% "
+                        f"({stats.size}/{stats.max_size} активны). "
+                        f"Пул может вырасти до {stats.max_size} (доступно +{stats.available}).",
+                        type_msg="warning"
+                    )
+
+            # Желательно: не спамить error, а триггерить только при смене состояния
+            if stats.busy_pct >= 90 and changed:
+                await log_info(
+                    f"🚨 [pool] БЛИЗОК К ЛИМИТУ: {stats.busy_pct}% ёмкости "
+                    f"({stats.size}/{stats.max_size}). Увеличьте DB_POOL_MAX_SIZE!",
+                    type_msg="error"
+                )
+
+            previous_stats = stats.busy_pct
+               
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            await log_info(f"[pool] Ошибка мониторинга: {e}", type_msg="error")

@@ -1,4 +1,5 @@
-,gitignore
+.github
+.gitignore
 config/lang_dict.json
 config/config.json
 log/logs.log

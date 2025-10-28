@@ -361,46 +361,98 @@ if (uid) {
 # ============================================================================
 
 def ensure_twa() -> None:
-    """Детерминированный бут темы: Telegram SDK, pre-paint и симметричное применение dark/light."""
+    """
+    Инициализация Telegram WebApp с детерминированной загрузкой темы.
+    
+    Процесс:
+    1. Загрузка Telegram WebApp SDK
+    2. Pre-paint: установка цвета фона до первого рендера (предотвращает мигание)
+    3. Определение темы из:
+       - localStorage.theme_override (выбор пользователя)
+       - window.matchMedia (системная тема)
+    4. Применение классов body--dark/body--light для CSS переменных
+    5. Синхронизация с Quasar Dark mode
+    6. Установка backgroundColor через Telegram WebApp API
+    7. Загрузка сохранённой темы из БД (асинхронно)
+    8. Событие 'theme:ready' для координации с UI компонентами
+    
+    Критично: функция идемпотентна (можно вызывать многократно)
+    """
     c = ui.context.client
-
+    
+    # Шаг 1: SDK загружается один раз на клиента
     if not c.storage.get('twa_sdk_added'):
         ui.add_head_html('<script src="https://telegram.org/js/telegram-web-app.js"></script>')
         ui.add_head_html(
             '<meta name="viewport" '
-            'content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">'
+            'content="width=device-width, initial-scale=1, maximum-scale=1, '
+            'user-scalable=no, viewport-fit=cover">'
         )
         c.storage['twa_sdk_added'] = True
-        
+    
+    # Шаг 2-8: Boot-скрипт загружается один раз    
     if not c.storage.get('theme_boot_added'):
-    # 1) pre-paint можно оставить как CSS в head (ui.add_head_html(...style...))
-    # 2) сам boot — запускать КОДОМ
         ui.run_javascript(r"""
         (function(){
-          // --- PRE-PAINT (как у вас): bg + color-scheme ---
-          var ov=null; try{ ov=localStorage.getItem('theme_override'); }catch(_){}
+          // PRE-PAINT: Устанавливаем фон ДО первого рендера
+          // Это предотвращает белую вспышку на тёмной теме
+          var ov=null; 
+          try { 
+            ov=localStorage.getItem('theme_override'); 
+          } catch(_) {}
+          
+          // Определяем желаемую тему
           var preferDark = ov ? (ov==='dark')
-                              : (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+                              : (window.matchMedia && 
+                                 matchMedia('(prefers-color-scheme: dark)').matches);
           var desired = preferDark ? 'dark' : 'light';
           var isDark = (desired==='dark');
 
-          try{
-            document.documentElement.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
-            document.body.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
-            document.documentElement.style.setProperty('color-scheme', isDark ? 'dark' : 'light');
-            // Применяем сразу классы и Quasar
+          try {
+            // Применяем цвета немедленно
+            document.documentElement.style.backgroundColor = 
+              isDark ? '#0b0b0c' : '#ffffff';
+            document.body.style.backgroundColor = 
+              isDark ? '#0b0b0c' : '#ffffff';
+            document.documentElement.style.setProperty(
+              'color-scheme', 
+              isDark ? 'dark' : 'light'
+            );
+            
+            // Синхронизируем классы и Quasar
             document.body.classList.toggle('body--dark', isDark);
             document.body.classList.toggle('body--light', !isDark);
             window.Quasar?.Dark?.set?.(isDark);
+            
             // Телеграм фон
-            window.Telegram?.WebApp?.setBackgroundColor?.(isDark ? '#0b0b0c' : '#ffffff');
-          }catch(e){}
+            window.Telegram?.WebApp?.setBackgroundColor?.(
+              isDark ? '#0b0b0c' : '#ffffff'
+            );
+          } catch(e) {
+            console.error('[ensure_twa] Pre-paint failed:', e);
+          }
 
-          // Попытка подтянуть user_id и тему из БД (если есть) — необязателен для «моментального» применения
+          // Асинхронная загрузка темы из БД (не блокирует рендер)
           (async () => {
-            // ... ваша логика получения uid и fetch('/api/theme?user_id=...') ...
-            // при ответе 'light'/'dark' — переустановить классы/Quasar/цвет
+            try {
+              const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id;
+              if (uid) {
+                const resp = await fetch(`/api/theme?user_id=${uid}`);
+                const data = await resp.json();
+                if (data.theme && data.theme !== desired) {
+                  // Применяем тему из БД, если отличается
+                  const dbIsDark = (data.theme === 'dark');
+                  document.body.classList.toggle('body--dark', dbIsDark);
+                  document.body.classList.toggle('body--light', !dbIsDark);
+                  window.Quasar?.Dark?.set?.(dbIsDark);
+                  // ... (остальная синхронизация)
+                }
+              }
+            } catch(e) {
+              console.warn('[ensure_twa] DB theme load failed:', e);
+            }
           })().finally(() => {
+            // Сигнализируем готовность темы
             window.__THEME_BOOT_DONE = true;
             window.dispatchEvent(new Event('theme:ready'));
           });

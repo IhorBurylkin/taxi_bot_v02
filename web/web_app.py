@@ -9,7 +9,7 @@ from nicegui import ui, app, storage
 from web.web_decorators import require_twa, with_theme_toggle, with_svg_splash_img
 from web.web_start_reg_form import start_reg_form_ui
 from web.web_utilits import get_user_data_uid_lang
-from web.splash_animation import splash_screen
+from web.splash.splash_animation import splash_screen
 
 from log.log import log_info
 from config.config_utils import lang_dict

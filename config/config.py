@@ -1,4 +1,5 @@
 from functools import lru_cache
+from copy import deepcopy
 import json
 
 def load_config(file_path: str):
@@ -18,8 +19,14 @@ def load_config(file_path: str):
         return
     
 @lru_cache(maxsize=2)
-def get_settings(file_path: str):
+def _load_config_cached(file_path: str):
+    """Внутренняя функция для кеширования загрузки"""
     return load_config(file_path)
+
+def get_settings(file_path: str):
+    """Возвращает глубокую копию конфига для безопасной мутации"""
+    cached = _load_config_cached(file_path)
+    return deepcopy(cached) if cached else None
 
 config = get_settings("config/config.json")
 lang_dict = get_settings("config/lang_dict.json")

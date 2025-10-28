@@ -293,29 +293,6 @@ async def list_other_available_drivers(city: str, exclude_user_id: int) -> List[
         await release_connection(connection)
 
 
-async def complete_order(order_id: int, driver_id: int) -> Optional[int]:
-    """
-    Завершает заказ только если этот водитель назначен и статус 'accepted'.
-    Ставит status='completed', trip_end=NOW(). Возвращает passenger_id или None.
-    """
-    connection = await get_connection()
-    try:
-        row = await connection.fetchrow(
-            """
-            UPDATE orders
-            SET status = 'completed', trip_end = NOW()
-            WHERE order_id = $1 AND driver_id = $2 AND status = 'accepted'
-            RETURNING passenger_id
-            """,
-            order_id, driver_id
-        )
-        return row["passenger_id"] if row else None
-    except Exception as e:
-        await log_info(f"complete_order failed: {e}", type_msg="error")
-        return None
-    finally:
-        await release_connection(connection)
-
 async def cancel_order(order_id: int, initiator_id: int) -> Optional[Dict]:
     """
     Атомарная отмена заказа из ЛЮБОГО активного статуса.

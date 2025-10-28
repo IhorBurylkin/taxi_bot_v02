@@ -27,129 +27,105 @@ from nicegui import ui
 
 
 def _get_default_svg() -> str:
-    """Дефолтный SVG с анимацией для SPAR-TAXI"""
-    return '''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg"
+    """Дефолтный SVG с анимацией для SPAR-TAXI (адаптирован для веба/мобилок)"""
+    return '''<svg xmlns="http://www.w3.org/2000/svg"
      viewBox="0 0 400 600"
-     width="100%" height="100%"
-     preserveAspectRatio="xMidYMid meet">
-  
+     preserveAspectRatio="xMidYMid slice"
+     role="img" aria-label="SPAR-TAXI loading"
+     style="width:100vw;height:100svh;display:block">
+
   <defs>
     <!-- Градиент фона -->
-    <linearGradient id="bgGradient" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" stop-color="#0057B7"/>
       <stop offset="100%" stop-color="#FFD500"/>
     </linearGradient>
-    
-    <!-- Свечение -->
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
+
+    <!-- Свечение (умеренное значение для мобильной производительности) -->
+    <filter id="glow" filterUnits="objectBoundingBox">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
-    
+
     <!-- Анимации -->
     <style>
+      /* ВАЖНО: трансформации для SVG через CSS */
+      .tbox { transform-box: fill-box; transform-origin: center; }
+
       @keyframes fadeIn {
-        from { opacity: 0; transform: scale(0.8); }
-        to { opacity: 1; transform: scale(1); }
+        from { opacity: 0; transform: scale(0.9); }
+        to   { opacity: 1; transform: scale(1); }
       }
-      
       @keyframes pulse {
-        0%, 100% { opacity: 0.6; }
-        50% { opacity: 1; }
+        0%,100% { opacity: .6; }
+        50%     { opacity: 1; }
       }
-      
       @keyframes rotate {
-        from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
       }
-      
       @keyframes dotBounce {
-        0%, 80%, 100% { transform: translateY(0); }
-        40% { transform: translateY(-10px); }
+        0%,80%,100% { transform: translateY(0); }
+        40%         { transform: translateY(-10px); }
       }
-      
-      .logo {
-        animation: fadeIn 0.8s ease-out forwards;
-        transform-origin: center;
-      }
-      
-      .spinner {
-        animation: rotate 2s linear infinite;
-        transform-origin: center;
-      }
-      
-      .pulse {
-        animation: pulse 2s ease-in-out infinite;
-      }
-      
-      .dot {
-        animation: dotBounce 1.4s ease-in-out infinite;
-      }
-      
-      .dot:nth-child(2) { animation-delay: 0.2s; }
-      .dot:nth-child(3) { animation-delay: 0.4s; }
+
+      .logo    { animation: fadeIn .8s ease-out forwards; }
+      .spinner { animation: rotate 2s linear infinite; }
+      .pulse   { animation: pulse 2s ease-in-out infinite; }
+      .dot     { animation: dotBounce 1.4s ease-in-out infinite; }
+
+      .dot:nth-child(2) { animation-delay: .2s; }
+      .dot:nth-child(3) { animation-delay: .4s; }
+
+      /* Системные шрифты с поддержкой латиницы/кириллицы */
+      text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif; }
     </style>
   </defs>
-  
+
   <!-- Фон -->
   <rect width="100%" height="100%" fill="url(#bgGradient)"/>
-  
+
   <!-- Центральная группа -->
-  <g class="logo">
-    <!-- Основной логотип/текст -->
+  <g class="logo tbox">
+    <!-- Центральный блок -->
     <g transform="translate(200, 250)">
       <!-- Круг со спиннером -->
-      <circle cx="0" cy="0" r="60" fill="rgba(255,255,255,0.1)" stroke="white" 
-              stroke-width="2" class="pulse"/>
-      
-      <g class="spinner">
-        <circle cx="0" cy="-50" r="8" fill="white"/>
-        <circle cx="35" cy="-35" r="6" fill="white" opacity="0.8"/>
-        <circle cx="50" cy="0" r="4" fill="white" opacity="0.6"/>
-        <circle cx="35" cy="35" r="6" fill="white" opacity="0.4"/>
-      </g>
-      
-      <!-- Логотип такси -->
-      <g filter="url(#glow)">
+      <circle cx="0" cy="0" r="60" fill="rgba(255,255,255,0.1)" stroke="white" stroke-width="2" class="pulse"/>
+
+      <!-- «Такси»-бейдж -->
+      <g filter="url(#glow)" class="tbox">
         <rect x="-30" y="-20" width="60" height="40" rx="8" fill="#1a1a1a"/>
         <rect x="-25" y="-15" width="50" height="30" rx="4" fill="#FFD500"/>
-        <text x="0" y="5" text-anchor="middle" font-size="20" 
-              font-weight="bold" fill="#1a1a1a" font-family="Arial">
-          TAXI
-        </text>
+        <text x="0" y="5" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">TAXI</text>
       </g>
     </g>
-    
+
     <!-- Название -->
-    <text x="200" y="360" text-anchor="middle" font-size="32" 
-          font-weight="bold" fill="white" font-family="Arial" filter="url(#glow)">
+    <text x="200" y="360" text-anchor="middle" font-size="32" font-weight="700" fill="#fff" filter="url(#glow)">
       SPAR-TAXI
     </text>
-    
+
     <!-- Подзаголовок -->
-    <text x="200" y="390" text-anchor="middle" font-size="14" 
-          fill="white" opacity="0.9" font-family="Arial">
+    <text x="200" y="390" text-anchor="middle" font-size="14" fill="#fff" opacity="0.9">
       für Ukrainer
     </text>
-    
-    <!-- Анимированные точки загрузки -->
-    <g transform="translate(200, 420)">
-      <circle class="dot" cx="-20" cy="0" r="4" fill="white"/>
-      <circle class="dot" cx="0" cy="0" r="4" fill="white"/>
-      <circle class="dot" cx="20" cy="0" r="4" fill="white"/>
-    </g>
-    
-    <!-- Текст загрузки -->
-    <text x="200" y="460" text-anchor="middle" font-size="12" 
-          fill="white" opacity="0.8" font-family="Arial">
-      Loading...
+
+    <!-- Українська фраза -->
+    <text x="200" y="415" text-anchor="middle" font-size="13" fill="#fff" opacity="0.85" font-style="italic">
+      Таксі, що долає від серця до серця.
     </text>
+
+    <!-- Точки загрузки -->
+    <g transform="translate(200, 440)">
+      <circle class="dot tbox" cx="-20" cy="0" r="4" fill="#fff"/>
+      <circle class="dot tbox" cx="0"   cy="0" r="4" fill="#fff"/>
+      <circle class="dot tbox" cx="20"  cy="0" r="4" fill="#fff"/>
+    </g>
   </g>
 </svg>'''
+
 
 
 def _load_svg(svg_path: str | None) -> str:
@@ -214,7 +190,7 @@ async def show_splash_immediate(
                 width: 100%;
                 height: 100%;
                 background-image: url('{svg_data_url}');
-                background-size: contain;
+                background-size: cover;
                 background-position: center;
                 background-repeat: no-repeat;
             "></div>

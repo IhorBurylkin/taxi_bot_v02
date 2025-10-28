@@ -235,26 +235,52 @@ async def start_reg_form_ui(uid, user_lang, user_data) -> None:
                         # ВАЖНО: объявляем хэндлер ДО привязки к кнопке
                         async def _finish_passenger(e):
                             if finish_lock.locked():
+                                await log_info(f"[finish_passenger] Параллельная попытка для uid={uid}", type_msg="warning")
                                 return
                             async with finish_lock:
-                                data = {'role': 'passenger', 'country': model['country'], 'region': model['region'], 'city': model['city'], 'phone_passenger': model['phone_passenger'], 'phone_driver': model['phone_passenger']}
-                                if await user_exists(uid):
-                                    await update_table('users', uid, data)
-                                else:
-                                    data['user_id'] = uid
-                                    await insert_into_table('users', data)
-                                await send_info_msg(
-                                    text=f'Тип сообщения: Инфо\nНовый пассажир!\n'
-                                    f'Username: {user_data.get("username") if user_data else "—"}\n'
-                                    f'First name: {user_data.get("first_name") if user_data else "—"}\n'
-                                    f'User ID: {uid}\n'
-                                    f'Country: {data["country"]}\n'
-                                    f'Region: {data["region"]}\n'
-                                    f'City: {data["city"]}\n'
-                                    f'Phone: {data["phone_passenger"]}\n',
-                                    type_msg_tg="new_users"
-                                )
-                                ui.navigate.to('/main_app?tab=main')
+                                await log_info(f"[finish_passenger] Начало регистрации uid={uid}", type_msg="info")
+                                
+                                try:
+                                    data = {
+                                        'role': 'passenger',
+                                        'country': model['country'],
+                                        'region': model['region'],
+                                        'city': model['city'],
+                                        'phone_passenger': model['phone_passenger'],
+                                        'phone_driver': model['phone_passenger']
+                                    }
+                                    
+                                    if await user_exists(uid):
+                                        await update_table('users', uid, data)
+                                        await log_info(f"[finish_passenger] Обновлён пассажир uid={uid}", type_msg="info")
+                                    else:
+                                        data['user_id'] = uid
+                                        await insert_into_table('users', data)
+                                        await log_info(f"[finish_passenger] Создан новый пассажир uid={uid}", type_msg="info")
+                                    
+                                    # Отправка уведомления
+                                    await send_info_msg(
+                                        text=f'Тип сообщения: Инфо\nНовый пассажир!\n'
+                                            f'Username: {user_data.get("username") if user_data else "—"}\n'
+                                            f'First name: {user_data.get("first_name") if user_data else "—"}\n'
+                                            f'User ID: {uid}\n'
+                                            f'Country: {data["country"]}\n'
+                                            f'Region: {data["region"]}\n'
+                                            f'City: {data["city"]}\n'
+                                            f'Phone: {data["phone_passenger"]}\n',
+                                        type_msg_tg="new_users"
+                                    )
+                                    
+                                    await log_info(f"[finish_passenger] Успешно завершено для uid={uid}", type_msg="info")
+                                    ui.navigate.to('/main_app?tab=main')
+                                    
+                                except Exception as ex:
+                                    await log_info(f"[finish_passenger][ОШИБКА] uid={uid} | {ex!r}", type_msg="error")
+                                    ui.notify(
+                                        lang_dict('error_registration', user_lang),
+                                        type='negative',
+                                        position='center'
+                                    )
 
 
                     # 4) Авто (только для водителя)
