@@ -20,34 +20,55 @@ if not getattr(app.state, 'theme_api_added', False):
 
     @app.get('/api/theme')
     async def _get_theme(user_id: int | None = None):
-        theme = None
         try:
-            if user_id:
+            if not user_id:
+                await log_info('[api/theme][GET] параметр user_id отсутствует', type_msg='warning')
+                return {'theme': None}
+
+            theme: str | None = None
+            try:
                 theme = await get_user_theme(int(user_id))
-        except Exception:
-            theme = None
-        return {'theme': theme}
+                await log_info(f'[api/theme][GET] uid={user_id} тема={theme}', type_msg='info')
+            except Exception as db_error:
+                await log_info(f'[api/theme][GET][ОШИБКА] uid={user_id} {db_error!r}', type_msg='error')
+                theme = None
+
+            return {'theme': theme}
+        except Exception as unexpected_error:
+            await log_info(f'[api/theme][GET][ОШИБКА] {unexpected_error!r}', type_msg='error')
+            return {'theme': None}
 
     @app.post('/api/theme')
     async def _save_theme(req: Request):
         try:
             payload = await req.json()
-        except Exception:
+        except Exception as parse_error:
+            await log_info(f'[api/theme][POST][ОШИБКА] не удалось разобрать JSON: {parse_error!r}', type_msg='error')
             return {'ok': False, 'error': 'invalid_json'}
-        uid = payload.get('user_id')
+
+        uid_raw = payload.get('user_id')
         theme = payload.get('theme')
-        if not (uid and theme in ('light', 'dark')):
+        if not (uid_raw and theme in ('light', 'dark')):
+            await log_info(f'[api/theme][POST] некорректные параметры: uid={uid_raw}, theme={theme}', type_msg='warning')
             return {'ok': False, 'error': 'bad_params'}
+
         try:
-            uid = int(uid)
+            uid = int(uid_raw)
+        except (TypeError, ValueError) as cast_error:
+            await log_info(f'[api/theme][POST] uid не является числом: {uid_raw!r} ({cast_error!r})', type_msg='error')
+            return {'ok': False, 'error': 'bad_params'}
+
+        try:
             data = {'theme_mode': theme}
             if await user_exists(uid):
                 await update_table('users', uid, data)
             else:
                 data['user_id'] = uid
                 await insert_into_table('users', data)
+            await log_info(f'[api/theme][POST] uid={uid} сохранена тема={theme}', type_msg='info')
             return {'ok': True}
-        except Exception:
+        except Exception as db_error:
+            await log_info(f'[api/theme][POST][ОШИБКА] uid={uid} {db_error!r}', type_msg='error')
             return {'ok': False, 'error': 'db_error'}
 
     app.state.theme_api_added = True
@@ -233,12 +254,56 @@ def _ensure_theme_assets_once() -> None:
     opacity: .86;
   }
   
-  /* Прозрачный футер */
+  /* Футер: непрозрачный контейнер с верхней границей */
   .app-footer {
-    background: transparent !important;
+    background: var(--bg-card) !important;
+    border-top: 1px solid var(--border) !important;
+    box-shadow: 0 -4px 18px rgba(0,0,0,.08) !important;
     -webkit-backdrop-filter: none !important;
     backdrop-filter: none !important;
-    border-top: 0 !important;
+  }
+
+  /* Главная страница: контейнер вкладок с ограничением по высоте */
+  .main-app-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 64px));
+    overflow-y: auto;
+  }
+
+  /* Профиль: карточки и элементы меню */
+  .profile-header-card {
+    background: linear-gradient(180deg, rgba(46,204,113,.14) 0%, rgba(46,204,113,0) 90%);
+    border: 1px solid rgba(46,204,113,.24) !important;
+    box-shadow: none !important;
+  }
+
+  .profile-avatar {
+    border: 3px solid rgba(46,204,113,.35);
+    background-color: transparent !important;
+  }
+
+  .profile-menu-card {
+    border-radius: 14px;
+    box-shadow: none !important;
+    border: 1px solid var(--border) !important;
+  }
+
+  .profile-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid rgba(0,0,0,.08);
+  }
+
+  .profile-menu-item:last-child {
+    border-bottom: none;
+  }
+
+  body.body--dark .profile-menu-item {
+    border-bottom: 1px solid rgba(255,255,255,.08);
   }
 </style>
 ''')
@@ -391,42 +456,192 @@ def ensure_twa() -> None:
         )
         c.storage['twa_sdk_added'] = True
     
-    # Шаг 2-8: Boot-скрипт загружается один раз    
-    if not c.storage.get('theme_boot_added'):
-    # 1) pre-paint можно оставить как CSS в head (ui.add_head_html(...style...))
-    # 2) сам boot — запускать КОДОМ
-        ui.run_javascript(r"""
-        (function(){
-          // --- PRE-PAINT (как у вас): bg + color-scheme ---
-          var ov=null; try{ ov=localStorage.getItem('theme_override'); }catch(_){}
-          var preferDark = ov ? (ov==='dark')
-                              : (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
-          var desired = preferDark ? 'dark' : 'light';
-          var isDark = (desired==='dark');
+    # Шаг 2-8: скрипт инициализации темы выполняется при каждом заходе, но сам себя делает идемпотентным
+    ui.run_javascript(r"""
+    (function(){
+      if (window.__THEME_BOOTSTRAP_INITIALIZED) {
+        return;
+      }
+      window.__THEME_BOOTSTRAP_INITIALIZED = true;
 
-          try{
-            document.documentElement.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
-            document.body.style.backgroundColor = isDark ? '#0b0b0c' : '#ffffff';
-            document.documentElement.style.setProperty('color-scheme', isDark ? 'dark' : 'light');
-            // Применяем сразу классы и Quasar
-            document.body.classList.toggle('body--dark', isDark);
-            document.body.classList.toggle('body--light', !isDark);
-            window.Quasar?.Dark?.set?.(isDark);
-            // Телеграм фон
-            window.Telegram?.WebApp?.setBackgroundColor?.(isDark ? '#0b0b0c' : '#ffffff');
-          }catch(e){}
+      const state = {
+        quasarTimer: null,
+        pending: null,
+      };
 
-          // Попытка подтянуть user_id и тему из БД (если есть) — необязателен для «моментального» применения
-          (async () => {
-            // ... ваша логика получения uid и fetch('/api/theme?user_id=...') ...
-            // при ответе 'light'/'dark' — переустановить классы/Quasar/цвет
-          })().finally(() => {
-            window.__THEME_BOOT_DONE = true;
-            window.dispatchEvent(new Event('theme:ready'));
-          });
+      const syncQuasarDark = (dark) => {
+        try {
+          if (window.Quasar?.Dark) {
+            window.Quasar.Dark.set(dark);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+
+      const applyTheme = (theme) => {
+        if (theme !== 'dark' && theme !== 'light') { return; }
+        const dark = theme === 'dark';
+        try {
+          document.documentElement.style.backgroundColor = dark ? '#0b0b0c' : '#ffffff';
+          document.body.style.backgroundColor = dark ? '#0b0b0c' : '#ffffff';
+          document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (_) {}
+        try {
+          document.body.classList.toggle('body--dark', dark);
+          document.body.classList.toggle('body--light', !dark);
+        } catch (_) {}
+        if (!syncQuasarDark(dark)) {
+          if (state.quasarTimer) {
+            clearInterval(state.quasarTimer);
+            state.quasarTimer = null;
+          }
+          state.quasarTimer = setInterval(() => {
+            if (syncQuasarDark(dark)) {
+              clearInterval(state.quasarTimer);
+              state.quasarTimer = null;
+            }
+          }, 40);
+          setTimeout(() => {
+            if (state.quasarTimer) {
+              clearInterval(state.quasarTimer);
+              state.quasarTimer = null;
+            }
+          }, 4000);
+        }
+        try { window.Telegram?.WebApp?.setBackgroundColor?.(dark ? '#0b0b0c' : '#ffffff'); } catch (_) {}
+        try {
+          const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
+          inputs.forEach((el) => { el.style.webkitTextFillColor = getComputedStyle(el).color; });
+        } catch (_) {}
+        window.__THEME_LAST = theme;
+        window.dispatchEvent(new CustomEvent('theme:applied', { detail: { theme } }));
+      };
+
+      const readOverride = () => {
+        try {
+          const stored = localStorage.getItem('theme_override');
+          if (stored === 'dark' || stored === 'light') {
+            return stored;
+          }
+        } catch (_) {}
+        return null;
+      };
+
+      const detectPreferred = () => {
+        const override = readOverride();
+        if (override) {
+          return override;
+        }
+        try {
+          const mq = window.matchMedia ? matchMedia('(prefers-color-scheme: dark)') : null;
+          if (mq && mq.matches) {
+            return 'dark';
+          }
+        } catch (_) {}
+        return 'light';
+      };
+
+      const rememberUid = (uid) => {
+        try { localStorage.setItem('tg_user_id', String(uid)); } catch (_) {}
+      };
+
+      const resolveUid = async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        for (let i = 0; i < 80; i += 1) {
+          try {
+            const direct = window?.Telegram?.WebApp?.initDataUnsafe?.user?.id;
+            if (direct) {
+              return direct;
+            }
+          } catch (_) {}
+          await wait(15);
+        }
+        try {
+          const fallback = localStorage.getItem('tg_user_id');
+          if (fallback) {
+            return fallback;
+          }
+        } catch (_) {}
+        return null;
+      };
+
+      const fetchThemeFromDb = async (uid) => {
+        try {
+          const response = await fetch(`/api/theme?user_id=${encodeURIComponent(uid)}`, { method: 'GET', cache: 'no-store' });
+          if (!response.ok) {
+            return null;
+          }
+          const data = await response.json();
+          const incoming = data?.theme;
+          if (incoming === 'dark' || incoming === 'light') {
+            return incoming;
+          }
+          return null;
+        } catch (_) {
+          return null;
+        }
+      };
+
+      const reapply = async () => {
+        if (state.pending) {
+          return state.pending;
+        }
+        state.pending = (async () => {
+          const preferred = detectPreferred();
+          applyTheme(preferred);
+
+          const override = readOverride();
+          if (override) {
+            applyTheme(override);
+          }
+
+          const uid = await resolveUid();
+          if (!uid) {
+            return;
+          }
+          rememberUid(uid);
+
+          const fromDb = await fetchThemeFromDb(uid);
+          if (fromDb) {
+            if (fromDb !== override) {
+              try { localStorage.setItem('theme_override', fromDb); } catch (_) {}
+              applyTheme(fromDb);
+            } else {
+              try { localStorage.setItem('theme_override', fromDb); } catch (_) {}
+            }
+          }
         })();
-        """)
-        c.storage['theme_boot_added'] = True
+        try {
+          await state.pending;
+        } finally {
+          state.pending = null;
+        }
+      };
+
+      window.__THEME_BOOTSTRAP = {
+        applyTheme,
+        detectPreferred,
+        reapply,
+      };
+    })();
+    """)
+
+    ui.run_javascript(r"""
+    (async function(){
+      if (!window.__THEME_BOOTSTRAP?.reapply) {
+        return;
+      }
+      window.__THEME_BOOT_DONE = false;
+      try {
+        await window.__THEME_BOOTSTRAP.reapply();
+      } finally {
+        window.__THEME_BOOT_DONE = true;
+        window.dispatchEvent(new Event('theme:ready'));
+      }
+    })();
+    """)
 
 
 # ============================================================================
@@ -437,8 +652,20 @@ def require_twa(fn):
     """Декоратор для обязательной инициализации Telegram WebApp"""
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
-        ensure_twa()
-        return await fn(*args, **kwargs)
+        try:
+            # Обеспечиваем загрузку SDK и применение темы перед выполнением обработчика
+            await log_info('[require_twa] декоратор вызван', type_msg='debug')
+            ensure_twa()
+            await log_info('[require_twa] ensure_twa выполнен', type_msg='debug')
+        except Exception as error:
+            await log_info(f'[require_twa][ОШИБКА] {error!r}', type_msg='error')
+            raise
+
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as error:
+            await log_info(f'[require_twa][fn][ОШИБКА] {error!r}', type_msg='error')
+            raise
     return wrapper
 
 

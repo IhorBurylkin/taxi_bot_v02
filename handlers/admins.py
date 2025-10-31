@@ -57,6 +57,12 @@ class AdminStates(StatesGroup):
     confirm_unblock_user = State() 
 
 
+# --- Унифицированное логирование ---
+
+async def _log_admin(message: str, *, type_msg: str, actor_id: int | None = None) -> None:
+    await log_info(message, type_msg=type_msg, log="admins", user_id=actor_id)
+
+
 # ====== Утилиты доступа/проверки контекста ======
 
 def _allowed_place(obj: Any) -> bool:
@@ -85,7 +91,7 @@ async def _delete_user_sql(user_id: int) -> bool:
         row = await conn.fetchrow("DELETE FROM users WHERE user_id = $1 RETURNING user_id", user_id)
         return bool(row)
     except Exception as e:
-        await log_info(f"delete user failed: {e}", type_msg="error", log="admins")
+        await _log_admin(f"delete user failed: {e}", type_msg="error", actor_id=user_id)
         return False
     finally:
         await release_connection(conn)
@@ -146,7 +152,7 @@ async def _block_user_sql(user_id: int) -> bool:
         )
         return bool(row)
     except Exception as e:
-        await log_info(f"block user failed: {e}", type_msg="error", log="admins")
+        await _log_admin(f"block user failed: {e}", type_msg="error", actor_id=user_id)
         return False
     finally:
         await release_connection(conn)
@@ -160,7 +166,7 @@ async def _unblock_user_sql(user_id: int) -> bool:
         )
         return bool(row)
     except Exception as e:
-        await log_info(f"unblock user failed: {e}", type_msg="error", log="admins")
+        await _log_admin(f"unblock user failed: {e}", type_msg="error", actor_id=user_id)
         return False
     finally:
         await release_connection(conn)
@@ -650,11 +656,13 @@ async def cb_refresh(cb: CallbackQuery, state: FSMContext):
 async def cb_toggle_stars(cb: CallbackQuery, state: FSMContext):
     if not _allowed_place(cb.message):
         return
+    admin_id = cb.from_user.id
     upd = await _toggle_stars_enabled()
     await cb.answer(f"Stars: {'Включено' if upd.get('stars_enabled') else 'Выключено'}")
-    await log_info(
-        f"[admin {cb.from_user.id}] toggle stars_enabled → {bool(upd.get('stars_enabled'))}",
-        type_msg="info", log="admins"
+    await _log_admin(
+        f"[admin {admin_id}] toggle stars_enabled → {bool(upd.get('stars_enabled'))}",
+        type_msg="info",
+        actor_id=admin_id,
     )
     kb = await build_admin_kb()
     await _edit_panel_main_by_state(state, "Админ-панель", kb)

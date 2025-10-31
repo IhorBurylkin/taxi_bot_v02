@@ -41,12 +41,20 @@ async def user_exists(user_id: int) -> bool:
         query = "SELECT 1 FROM users WHERE user_id = $1 LIMIT 1;"
         result = await connection.fetchval(query, user_id)
         
-        await log_info(f"Проверка user_id {user_id} в таблице users завершена успешно.", type_msg="info")
+        await log_info(
+            f"Проверка user_id {user_id} в таблице users завершена успешно.",
+            type_msg="info",
+            user_id=user_id,
+        )
         
         # If result is not None, the user was found.
         return True if result else False
     except Exception as e:
-        await log_info(f"Ошибка проверки пользователя {user_id}: {e}", type_msg="error")
+        await log_info(
+            f"Ошибка проверки пользователя {user_id}: {e}",
+            type_msg="error",
+            user_id=user_id,
+        )
         return False
     finally:
         if connection:
@@ -117,7 +125,8 @@ async def update_table(table_name: str, user_id: int, updates: dict, data_order_
 
             await log_info(
                 f"Обновлены колонки {list(updates.keys())} в таблице {table_name} для order_id={user_id}",
-                type_msg="info"
+                type_msg="info",
+                user_id=user_id,
             )
             return True
         else:
@@ -133,17 +142,42 @@ async def update_table(table_name: str, user_id: int, updates: dict, data_order_
 
             await log_info(
                 f"Обновлены колонки {list(updates.keys())} в таблице {table_name} для user_id={user_id}",
-                type_msg="info"
+                type_msg="info",
+                user_id=user_id,
             )
             return True
 
     except Exception as e:
         await log_info(
             f"Ошибка при обновлении таблицы {table_name} для user_id={user_id}: {e}",
-            type_msg="error"
+            type_msg="error",
+            user_id=user_id,
         )
         return False
 
+    finally:
+        if connection:
+            await release_connection(connection)
+
+async def delete_user(user_id: int) -> bool:
+    """Удаляем пользователя по user_id."""
+    connection = None
+    try:
+        connection = await get_connection()
+        await connection.execute('DELETE FROM "users" WHERE user_id = $1;', user_id)
+        await log_info(
+            f"Удалена строка пользователя user_id={user_id} из таблицы users",
+            type_msg="info",
+            user_id=user_id,
+        )
+        return True
+    except Exception as e:
+        await log_info(
+            f"Ошибка удаления пользователя user_id={user_id}: {e}",
+            type_msg="error",
+            user_id=user_id,
+        )
+        return False
     finally:
         if connection:
             await release_connection(connection)
@@ -167,16 +201,25 @@ async def get_user_data(table_name: str, user_id: int) -> dict | None:
         row = await connection.fetchrow(query, user_id)
 
         if row:
-            await log_info(f"Данные получены из {table_name} для user_id={user_id}", type_msg="info")
+            await log_info(
+                f"Данные получены из {table_name} для user_id={user_id}",
+                type_msg="info",
+                user_id=user_id,
+            )
             return dict(row)
 
-        await log_info(f"Запись не найдена в {table_name} для user_id={user_id}", type_msg="warning")
+        await log_info(
+            f"Запись не найдена в {table_name} для user_id={user_id}",
+            type_msg="warning",
+            user_id=user_id,
+        )
         return None
 
     except Exception as e:
         await log_info(
             f"Ошибка при получении данных из {table_name} для user_id={user_id}: {e}",
-            type_msg="error"
+            type_msg="error",
+            user_id=user_id,
         )
         return None
 
@@ -220,7 +263,11 @@ async def reserve_order(order_id: int, driver_id: int) -> Optional[Dict]:
         )
         return dict(row) if row else None
     except Exception as e:
-        await log_info(f"reserve_order failed: {e}", type_msg="error")
+        await log_info(
+            f"reserve_order failed: {e}",
+            type_msg="error",
+            user_id=driver_id,
+        )
         return None
     finally:
         await release_connection(connection)
@@ -232,7 +279,11 @@ async def set_driver_working(driver_id: int, is_working: bool) -> bool:
         await connection.execute("UPDATE users SET is_working = $1 WHERE user_id = $2", is_working, driver_id)
         return True
     except Exception as e:
-        await log_info(f"set_driver_working failed: {e}", type_msg="error")
+        await log_info(
+            f"set_driver_working failed: {e}",
+            type_msg="error",
+            user_id=driver_id,
+        )
         return False
     finally:
         await release_connection(connection)
@@ -247,7 +298,11 @@ async def fetch_passenger_contact(passenger_id: int) -> Dict:
         )
         return dict(row) if row else {"first_name": "-", "phone_passenger": "-"}
     except Exception as e:
-        await log_info(f"fetch_passenger_contact failed: {e}", type_msg="error")
+        await log_info(
+            f"fetch_passenger_contact failed: {e}",
+            type_msg="error",
+            user_id=passenger_id,
+        )
         return {"first_name": "-", "phone_passenger": "-"}
     finally:
         await release_connection(connection)
@@ -267,7 +322,11 @@ async def fetch_driver_card(driver_id: int) -> Dict:
             "first_name": "-", "phone_driver": "-", "car_model": "-", "car_color": "-", "car_number": "-"
         }
     except Exception as e:
-        await log_info(f"fetch_driver_card failed: {e}", type_msg="error")
+        await log_info(
+            f"fetch_driver_card failed: {e}",
+            type_msg="error",
+            user_id=driver_id,
+        )
         return {
             "first_name": "-", "phone_driver": "-", "car_model": "-", "car_color": "-", "car_number": "-"
         }
@@ -287,7 +346,11 @@ async def list_other_available_drivers(city: str, exclude_user_id: int) -> List[
         )
         return [r["user_id"] for r in rows]
     except Exception as e:
-        await log_info(f"list_other_available_drivers failed: {e}", type_msg="error")
+        await log_info(
+            f"list_other_available_drivers failed: {e}",
+            type_msg="error",
+            user_id=exclude_user_id,
+        )
         return []
     finally:
         await release_connection(connection)
@@ -317,7 +380,11 @@ async def cancel_order(order_id: int, initiator_id: int) -> Optional[Dict]:
             return None
         return {"passenger_id": row["passenger_id"], "driver_id": row["driver_id"]}
     except Exception as e:
-        await log_info(f"cancel_order failed: {e}", type_msg="error")
+        await log_info(
+            f"cancel_order failed: {e}",
+            type_msg="error",
+            user_id=initiator_id,
+        )
         return None
     finally:
         await release_connection(connection)
@@ -368,7 +435,11 @@ async def complete_order(order_id: int, driver_id: int) -> Optional[int]:
         )
         return row["passenger_id"] if row else None
     except Exception as e:
-        await log_info(f"complete_order failed: {e}", type_msg="error")
+        await log_info(
+            f"complete_order failed: {e}",
+            type_msg="error",
+            user_id=driver_id,
+        )
         return None
     finally:
         await release_connection(conn)
@@ -390,7 +461,11 @@ async def mark_trip_started(order_id: int, driver_id: int) -> bool:
         )
         return bool(row)
     except Exception as e:
-        await log_info(f"mark_trip_started failed: {e}", type_msg="error")
+        await log_info(
+            f"mark_trip_started failed: {e}",
+            type_msg="error",
+            user_id=driver_id,
+        )
         return False
     finally:
         await release_connection(conn)
@@ -578,20 +653,23 @@ async def get_latest_open_order_id_for_passenger(passenger_id: int) -> Optional[
         if order_id:
             await log_info(
                 f"Найден активный заказ для passenger_id={passenger_id}: order_id={order_id}",
-                type_msg="info"
+                type_msg="info",
+                user_id=passenger_id,
             )
             return int(order_id)
 
         await log_info(
             f"Активный заказ для passenger_id={passenger_id} не найден.",
-            type_msg="warning"
+            type_msg="warning",
+            user_id=passenger_id,
         )
         return None
 
     except Exception as e:
         await log_info(
             f"get_latest_open_order_id_for_passenger failed: {e}",
-            type_msg="error"
+            type_msg="error",
+            user_id=passenger_id,
         )
         return None
 

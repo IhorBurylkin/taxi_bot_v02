@@ -74,9 +74,14 @@ async def on_verify_driver(cq: CallbackQuery) -> None:
             reply_markup=get_verifed_inline_kb(lang),
         )
         await log_info(f"[verify_driver] ЛС отправлено пользователю: uid={uid}", type_msg="info")
-
-        notified = await notify_user(uid, lang_dict("verified", lang), level="positive", position="center")
-        await log_info(f"[verify_driver] notify_user result={bool(notified)} uid={uid}", type_msg="info")
+        try:
+            notified = await notify_user(uid, lang_dict("verified", lang), level="positive", position="center")
+            if not notified:
+                await log_info(f"[verify][notify][SKIP] uid={uid} (нет активного клиента, возможно отложено)", type_msg="warning")
+            else:
+                await log_info(f"[verify_driver] notify_user result={bool(notified)} uid={uid}", type_msg="info")
+        except Exception as e:
+            await log_info(f"[verify][notify][ОШИБКА] {e!r}", type_msg="error")
 
         await _append_status_and_drop_kb(cq, LABEL_VERIFIED)
         await log_info(f"[verify_driver] исходное сообщение помечено '{LABEL_VERIFIED}', uid={uid}", type_msg="info")
@@ -118,8 +123,14 @@ async def on_reject_driver(cq: CallbackQuery) -> None:
         )
         await log_info(f"[reject_driver] ЛС отправлено пользователю: uid={uid}", type_msg="info")
 
-        notified = await notify_user(uid, lang_dict("rejected", lang), level="warning", position="center")
-        await log_info(f"[reject_driver] notify_user result={bool(notified)} uid={uid}", type_msg="info")
+        try:
+            notified = await notify_user(uid, lang_dict("rejected", lang), level="warning", position="center")
+            if not notified:
+                await log_info(f"[reject][notify][SKIP] uid={uid} (нет активного клиента, возможно отложено)", type_msg="warning")
+            else:
+                await log_info(f"[reject_driver] notify_user result={bool(notified)} uid={uid}", type_msg="info")
+        except Exception as e:
+            await log_info(f"[reject][notify][ОШИБКА] {e!r}", type_msg="error")
 
         await _append_status_and_drop_kb(cq, LABEL_REJECTED)
         await log_info(f"[reject_driver] исходное сообщение помечено '{LABEL_REJECTED}', uid={uid}", type_msg="info")

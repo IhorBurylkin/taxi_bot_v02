@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import os
-
+import time
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi import FastAPI
 from nicegui import ui, app, storage
 from web.web_decorators import require_twa, with_theme_toggle
 from web.web_start_reg_form import start_reg_form_ui
-from web.web_utilits import get_user_data_uid_lang
+from web.web_utilits import get_user_data_uid_lang, _safe_js
 from web.splash.splash_animation import splash_screen
+from web.web_profile_menu import profile_menu
 
 from log.log import log_info
 from config.config_utils import lang_dict
 
 NAV_TABS   = ('main', 'trips', 'profile')
 PANEL_TABS = ('main', 'trips', 'profile', 'start_reg_form')
+
+_last_nav_ts: float = 0.0
 
 # ============================================================================
 # FastAPI + NiceGUI Setup
@@ -102,17 +105,36 @@ async def main_app():
     2. @require_twa - инициализирует Telegram WebApp и загружает тему
     3. @with_theme_toggle - добавляет переключатель темы
     """
+    uid: int | None = None
+
+    async def _log(message: str, *, type_msg: str) -> None:
+        await log_info(message, type_msg=type_msg, uid=uid)
+
     try:
-        await log_info("[page:/main_app] рендер начат", type_msg="info")
+        await _log("[page:/main_app] рендер начат", type_msg="info")
 
         # Получение данных пользователя
         uid, user_lang, user_data = await get_user_data_uid_lang()
         user_lang = user_lang or 'en'
 
         # Определение начальной вкладки из URL (без перезагрузки страницы)
-        start_tab = await ui.run_javascript(
-            "new URLSearchParams(location.search).get('tab') || null"
-        )
+        try:
+            start_tab = await ui.run_javascript(
+                "new URLSearchParams(location.search).get('tab') || null",
+                timeout=3.0,
+            )
+        except TimeoutError as timeout_error:
+            await _log(
+                f"[page:/main_app][start_tab][ОШИБКА] {timeout_error!r}",
+                type_msg="warning",
+            )
+            start_tab = None
+        except Exception as js_error:
+            await _log(
+                f"[page:/main_app][start_tab][ОШИБКА] {js_error!r}",
+                type_msg="error",
+            )
+            start_tab = None
 
         # Реактивное состояние: активная панель и активная кнопка футера
         panel = (
@@ -130,13 +152,14 @@ async def main_app():
         # ====================================================================
         # UI: Контейнер панелей
         # ====================================================================
-        
-        with ui.column().classes('w-full q-pa-none q-ma-none'):
+
+        with ui.column().classes('w-full q-pa-none q-ma-none main-app-content'):
             with ui.tab_panels() \
                     .bind_value(app.storage.user, 'panel') \
                     .props('animated keep-alive transition-prev=fade transition-next=fade') \
                     .classes('w-full') as panels:
-                
+                app.storage.client['tab_panels'] = panels
+
                 # Панель: Главная
                 with ui.tab_panel('main'):
                     with ui.column().classes('page-center'):
@@ -155,11 +178,7 @@ async def main_app():
 
                 # Панель: Профиль
                 with ui.tab_panel('profile'):
-                    with ui.column().classes('page-center'):
-                        ui.label(
-                            lang_dict('footer_profile', user_lang)
-                        ).classes('text-xl q-pa-md')
-                        # TODO: контент «Профиль»
+                    await profile_menu(uid, user_lang, user_data)
 
                 # Панель: Регистрация (скрытая, без кнопки в футере)
                 with ui.tab_panel('start_reg_form'):
@@ -175,7 +194,7 @@ async def main_app():
                     'panel', 
                     backward=lambda v: v != 'start_reg_form'
                 ) \
-                .props('reveal bordered') \
+                .props('bordered') \
                 .classes('app-footer no-shadow'):
             
             tabs = (
@@ -185,6 +204,7 @@ async def main_app():
                        'active-color=primary indicator-color=primary')
                 .classes('w-full')
             )
+            app.storage.client['nav_tabs'] = tabs
             
             with tabs:
                 ui.tab(
@@ -207,13 +227,62 @@ async def main_app():
             
             # Обработчик изменения вкладки
             async def _on_nav_change(e):
-                panels.set_value(e.value)
-                # Обновить URL без перезагрузки
-                await ui.run_javascript(
-                    f"history.replaceState(null, '', '/main_app?tab={e.value}')"
-                )
+                global _last_nav_ts
+                now = time.monotonic()
+                if now - _last_nav_ts < 0.20:  # 200 мс
+                    return
+                _last_nav_ts = now
+                try:
+                    panels.set_value(e.value)
+                    # Обновляем URL безопасно, без падения при таймауте.
+                    code = f"history.replaceState(null, '', '/main_app?tab={e.value}')"
+                    # Вариант А: сразу, но с try/except и большим timeout
+                    ok = await _safe_js(code, timeout=3.0)
+
+                    # Вариант B (доп.): если не успели — попробуем «следующим тиком»
+                    if not ok:
+                        ui.timer(0.0, lambda: ui.run_javascript(code), once=True)
+
+                except Exception as err:
+                    await _log(f"[nav.change][ОШИБКА] {err!r}", type_msg="error")
             
             tabs.on_value_change(_on_nav_change)
+
+        # --------------------------------------------------------------------
+        # JS: синхронизация высоты футера и доступной области (безопасная зона)
+        # --------------------------------------------------------------------
+        try:
+            await ui.run_javascript(
+                """
+                (function(){
+                  const doc = document.documentElement;
+                  const flagKey = '__main_app_vh_bound';
+                  if (doc[flagKey]) { return true; }
+                  const telegram = window.Telegram?.WebApp;
+
+                  const updateViewport = () => {
+                    const viewport = telegram?.viewportStableHeight || window.innerHeight;
+                    doc.style.setProperty('--main-app-viewport', `${viewport}px`);
+                    const footer = document.querySelector('.app-footer');
+                    if (!footer) { return; }
+                    const footerHeight = footer.getBoundingClientRect().height;
+                    doc.style.setProperty('--main-footer-height', `${footerHeight}px`);
+                  };
+
+                  updateViewport();
+                  window.addEventListener('resize', updateViewport);
+                  telegram?.onEvent?.('viewportChanged', updateViewport);
+                  doc[flagKey] = true;
+                  return true;
+                })();
+                """,
+                timeout=3.0,
+            )
+        except Exception as js_error:
+            await _log(
+                f"[page:/main_app][viewport][ОШИБКА] {js_error!r}",
+                type_msg="warning",
+            )
 
         # ====================================================================
         # Синхронизация состояния для прямых ссылок
@@ -223,12 +292,13 @@ async def main_app():
         if panel == 'start_reg_form' and app.storage.user.get('nav') != 'main':
             app.storage.user['nav'] = 'main'
 
-        await log_info("[page:/main_app] рендер завершён", type_msg="info")
+        await _log("[page:/main_app] рендер завершён", type_msg="info")
         
     except Exception as e:
         await log_info(
             f"[page:/main_app][ОШИБКА] {e!r}", 
-            type_msg="error"
+            type_msg="error",
+            uid=uid,
         )
         raise
 
@@ -248,8 +318,13 @@ async def main_app():
 @with_theme_toggle(True)           # Добавление переключателя темы
 async def reg_form_page():  
     """Страница регистрации пользователя."""
+    uid: int | None = None
+
+    async def _log(message: str, *, type_msg: str) -> None:
+        await log_info(message, type_msg=type_msg, uid=uid)
+
     try:
-        await log_info("[page:/start_reg_form] рендер начат", type_msg="info")
+        await _log("[page:/start_reg_form] рендер начат", type_msg="info")
 
         # Получение данных пользователя
         uid, user_lang, user_data = await get_user_data_uid_lang()
@@ -258,11 +333,12 @@ async def reg_form_page():
         # UI: Форма регистрации
         await start_reg_form_ui(uid, user_lang, user_data, choice_role=True)
 
-        await log_info("[page:/start_reg_form] рендер завершён", type_msg="info")
+        await _log("[page:/start_reg_form] рендер завершён", type_msg="info")
 
     except Exception as e:
         await log_info(
             f"[page:/start_reg_form][ОШИБКА] {e!r}", 
-            type_msg="error"
+            type_msg="error",
+            uid=uid,
         )
         raise

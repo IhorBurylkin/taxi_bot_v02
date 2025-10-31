@@ -30,21 +30,32 @@ async def _is_user_blocked(user_id: int) -> bool:
         return bool(v)
     except Exception as e:
         # если не смогли прочитать — не блокируем по ошибке, но логируем
-        await log_info(f"_is_user_blocked failed for {user_id}: {e}", type_msg="warning")
+        await log_info(
+            f"_is_user_blocked failed for {user_id}: {e}",
+            type_msg="warning",
+            user_id=user_id,
+        )
         return False
 
 @router.message(Command("start"))
 async def send_welcome(message: types.Message):
     try:
-        await log_info(f"Получена команда /start от пользователя {message.from_user.id}", type_msg="info")
-
-        user_id = message.from_user.id
+        user_id: int | None = message.from_user.id
+        await log_info(
+            f"Получена команда /start от пользователя {user_id}",
+            type_msg="info",
+            user_id=user_id,
+        )
         chat_id = message.chat.id if message.chat.type == ChatType.PRIVATE else message.from_user.id
         user_lang = message.from_user.language_code
         lang = user_lang if user_lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGES
 
         user_id_exists = await user_exists(user_id)
-        await log_info(f"Проверка существования пользователя {user_id} в БД: {'найден' if user_id_exists else 'не найден'}", type_msg="info")
+        await log_info(
+            f"Проверка существования пользователя {user_id} в БД: {'найден' if user_id_exists else 'не найден'}",
+            type_msg="info",
+            user_id=user_id,
+        )
 
         if user_id_exists == False:
             user_data = {
@@ -60,7 +71,8 @@ async def send_welcome(message: types.Message):
                 f'Новый пользователь Username: {user_data["username"]} '
                 f'First name: {user_data["first_name"]} '
                 f'User ID: {user_data["user_id"]}',
-                type_msg="info"
+                type_msg="info",
+                user_id=user_id,
             )
 
         if await _is_user_blocked(user_id):
@@ -70,7 +82,11 @@ async def send_welcome(message: types.Message):
                 or "Ваш доступ к сервису временно заблокирован.\n"
                    "Если Вы считаете это ошибкой — напишите в поддержку командой /support."
             )
-            await log_info(f"/start: user {user_id} is blocked → show blocked notice", type_msg="info")
+            await log_info(
+                f"/start: user {user_id} is blocked → show blocked notice",
+                type_msg="info",
+                user_id=user_id,
+            )
             await message.answer(text, reply_markup=ReplyKeyboardRemove())
             return
 
@@ -80,5 +96,9 @@ async def send_welcome(message: types.Message):
         )
 
     except Exception as e:
-        await log_info(f"Ошибка в send_welcome: {e}", type_msg="error")
+        await log_info(
+            f"Ошибка в send_welcome: {e}",
+            type_msg="error",
+            user_id=user_id,
+        )
         raise

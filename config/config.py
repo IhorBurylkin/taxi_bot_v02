@@ -48,6 +48,7 @@ TELEGRAM_BOT_TOKEN_ALTERNATIVE = config.get("TELEGRAM_BOT_TOKEN_ALTERNATIVE")
 TELEGRAM_INFO_BOT_TOKEN = config.get("TELEGRAM_INFO_BOT_TOKEN")
 TELEGRAM_INFO_BOT_TOKEN_ALTERNATIVE = config.get("TELEGRAM_INFO_BOT_TOKEN_ALTERNATIVE")
 SUPPORTED_LANGUAGES = config.get("SUPPORTED_LANGUAGES")
+SUPPORTED_LANGUAGE_NAMES = config.get("SUPPORTED_LANGUAGE_NAMES")
 DEFAULT_LANGUAGES = config.get("DEFAULT_LANGUAGES")
 CITIES = config.get("CITIES")
 COUNTRY_CHOICES = config.get("COUNTRY_CHOICES")
@@ -72,6 +73,7 @@ TABLES_SCHEMAS = {
         "role": "VARCHAR(20) NOT NULL",
         "black_list": "BOOLEAN DEFAULT FALSE",
         "balance": "NUMERIC(10,2) DEFAULT 0.0",
+        "transactions": "JSONB",
         "country": "VARCHAR(100)",
         "region": "VARCHAR(100)",
         "city": "VARCHAR(100)",
@@ -152,6 +154,19 @@ TABLES_SCHEMAS = {
         "commission_percent": "NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (commission_percent >= 0)",
 
         "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"        # техническое поле обновления
-    }
+    },
+
+    "support_requests": {
+        "user_id": "BIGSERIAL PRIMARY KEY",
+        "messages": "JSONB"
+    },
+
+    "pending_notifications": {
+        "user_id": "BIGINT PRIMARY KEY",
+        "messages": "JSONB",
+        "level": "VARCHAR(10)",
+        "position": "VARCHAR(20)",
+        "created_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
+    },
 
 }

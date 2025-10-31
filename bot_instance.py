@@ -51,12 +51,12 @@ async def initialize_bots():
     # Test main bot tokens
     main_token = TELEGRAM_BOT_TOKEN
     info_token = TELEGRAM_INFO_BOT_TOKEN
-    if not await test_polling(main_token):
-        await log_info("Основной токен недоступен, используется альтернативный", type_msg="warning")
-        main_token = TELEGRAM_BOT_TOKEN_ALTERNATIVE
-        if not await test_polling(info_token):
-            await log_info("Инфо токен недоступен, используется альтернативный", type_msg="warning")
-            info_token = TELEGRAM_INFO_BOT_TOKEN_ALTERNATIVE
+    # if not await test_polling(main_token):
+    #     await log_info("Основной токен недоступен, используется альтернативный", type_msg="warning")
+    #     main_token = TELEGRAM_BOT_TOKEN_ALTERNATIVE
+    #     if not await test_polling(info_token):
+    #         await log_info("Инфо токен недоступен, используется альтернативный", type_msg="warning")
+    #         info_token = TELEGRAM_INFO_BOT_TOKEN_ALTERNATIVE
     
     # Create bots with selected tokens
     bot = await create_bot(main_token)

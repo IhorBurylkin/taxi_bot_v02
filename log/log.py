@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import os
+import inspect
 from aiogram.types import InlineKeyboardMarkup, FSInputFile, InputMediaPhoto, InputMediaDocument
 from config.config import (
     LOGGING_FILE_PATH,
@@ -248,27 +249,110 @@ async def send_info_msg(
         logger.error(f"Ошибка отправки служебного сообщения → chat={target_chat_id}, thread={target_thread_id}: {e}")
         return
 
-async def log_info(message: str, type_msg: str, log: str | None = None, *args, **kwargs: str):
+def _resolve_caller_context() -> tuple[str, dict[str, object]]:
+    """Определяем имя функции и локальные переменные вызывающего контекста."""
+    frame = inspect.currentframe()
+    if frame is None:
+        return "unknown", {}
+    try:
+        caller = frame.f_back
+        while caller is not None:
+            module = inspect.getmodule(caller)
+            module_name = module.__name__ if module else ""
+            if module_name.startswith("log."):
+                caller = caller.f_back
+                continue
+            func_name = caller.f_code.co_name
+            caller_locals = dict(caller.f_locals or {})
+            if module_name:
+                return f"{module_name}.{func_name}", caller_locals
+            return func_name, caller_locals
+        return "unknown", {}
+    finally:
+        del frame
+        try:
+            del caller  # type: ignore[name-defined]
+        except NameError:
+            pass
+
+
+async def log_info(
+    message: str,
+    type_msg: str,
+    log: str | None = None,
+    *args,
+    user_id: object | None = None,
+    uid: object | None = None,
+    **kwargs,
+) -> None:
     await init_logging()
     logger = logging.getLogger()  # root по умолчанию
     if log == "admins":
         await init_admin_logging()
         logger = _admin_logger or logger
-    if "info" in type_msg:  
-        logger.info(message, *args, extra=kwargs)
-    elif "error" in type_msg:
-        logger.error(message, *args, extra=kwargs)
+
+    caller_name, caller_locals = _resolve_caller_context()
+    user_identifier = user_id if user_id not in (None, "") else uid
+    if user_identifier in (None, ""):
+        for key in ("user_id", "uid", "actor_id", "admin_id", "passenger_id", "driver_id"):
+            if key in caller_locals:
+                candidate = caller_locals[key]
+                if candidate not in (None, ""):
+                    user_identifier = candidate
+                    break
+    if user_identifier in (None, ""):
+        potential_sources = []
+        for key in ("message", "msg", "callback", "cb", "cq", "call", "callback_query", "event", "update"):
+            if key in caller_locals:
+                potential_sources.append(caller_locals[key])
+        for source in potential_sources:
+            if source is None:
+                continue
+            user_obj = getattr(source, "from_user", None)
+            if user_obj is None and hasattr(source, "message"):
+                user_obj = getattr(source.message, "from_user", None)
+            candidate = getattr(user_obj, "id", None) if user_obj is not None else None
+            if candidate not in (None, ""):
+                user_identifier = candidate
+                break
+    prefixes: list[str] = [f"{caller_name}"]
+    if user_identifier not in (None, ""):
+        prefixes.append(f"user_id={user_identifier}")
+    prefix = f"[{' | '.join(prefixes)}]"
+    final_message = f"{prefix} {message}"
+
+    logger_extra = kwargs.pop("extra", None)
+    if logger_extra is None:
+        logger_extra = {}
+    elif not isinstance(logger_extra, dict):
+        logger_extra = {"extra": logger_extra}
+    logger_extra.setdefault("caller", caller_name)
+    if user_identifier not in (None, ""):
+        logger_extra.setdefault("user_id", user_identifier)
+
+    allowed_keys = {"exc_info", "stack_info", "stacklevel"}
+    logger_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in allowed_keys}
+    if kwargs:
+        logger_extra.update(kwargs)
+
+    level = (type_msg or "").lower()
+    if "info" in level:
+        logger.info(final_message, *args, extra=logger_extra, **logger_kwargs)
+    elif "error" in level:
+        logger.error(final_message, *args, extra=logger_extra, **logger_kwargs)
         await send_info_msg(
-            text=f'Тип сообщения: Ошибка\n{message}\n{args}\n{kwargs}', 
+            text=f"Тип сообщения: Ошибка\n{final_message}\n{args}\n{logger_extra}",
             message_thread_id=LOGGING_SETTINGS_TO_SEND_ERRORS["message_thread_id"],
             info_bot=_info_bot,
             type_msg_tg="error"
         )
-    elif "warning" in type_msg:
-        logger.warning(message, *args, extra=kwargs)
+    elif "warn" in level:
+        logger.warning(final_message, *args, extra=logger_extra, **logger_kwargs)
         await send_info_msg(
-            text=f'Тип сообщения: Предупреждение\n{message}\n{args}\n{kwargs}', 
+            text=f"Тип сообщения: Предупреждение\n{final_message}\n{args}\n{logger_extra}",
             message_thread_id=LOGGING_SETTINGS_TO_SEND_ERRORS["message_thread_id"],
             info_bot=_info_bot,
             type_msg_tg="warning"
         )
+    else:
+        logger.info(final_message, *args, extra=logger_extra, **logger_kwargs)
