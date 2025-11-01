@@ -4,12 +4,17 @@ import os
 import json
 import time
 import asyncio
+import base64
+import hashlib
+import hmac
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
+from aiohttp import ClientError, ClientSession, ClientTimeout
 from nicegui import ui, app
+from yarl import URL
 from web.web_start_reg_form import start_reg_form_ui
 from web.web_utilits import (
     DEFAULT_AVATAR_DATA_URL,
@@ -20,7 +25,13 @@ from web.web_utilits import (
 )
 
 from log.log import log_info
-from config.config import SUPPORTED_LANGUAGE_NAMES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES, GMAPS_API_KEY
+from config.config import (
+    SUPPORTED_LANGUAGE_NAMES,
+    SUPPORTED_LANGUAGES,
+    DEFAULT_LANGUAGES,
+    GMAPS_API_KEY,
+    GMAPS_URL_SIGNING_SECRET,
+)
 from config.config_utils import lang_dict
 from db.db_utils import delete_user, update_table
 
@@ -57,6 +68,150 @@ async def profile_menu(
     async def _log(message: str, *, type_msg: str) -> None:
         # Локальный помощник для логирования с привязкой текущего uid
         await log_info(message, type_msg=type_msg, uid=uid)
+
+    GMAPS_HOST = "maps.googleapis.com"
+    GMAPS_AUTOCOMPLETE_PATH = "/maps/api/place/autocomplete/json"
+    GMAPS_AUTOCOMPLETE_URL = f"https://{GMAPS_HOST}{GMAPS_AUTOCOMPLETE_PATH}"
+    GMAPS_REFERER_HEADER = os.getenv("GMAPS_REFERER", "https://telegram.org")
+    AUTOCOMPLETE_MIN_CHARS = 3
+    AUTOCOMPLETE_DEBOUNCE_SECONDS = 0.35
+    AUTOCOMPLETE_LIMIT = 5
+
+    gmaps_session: ClientSession | None = None
+    gmaps_session_lock = asyncio.Lock()
+
+    session_token: str | None = app.storage.user.get("gmaps_session_token")
+    if not session_token:
+        session_token = f"profile-{uuid4().hex}"
+        app.storage.user["gmaps_session_token"] = session_token
+
+    def _normalize_secret(secret: str) -> bytes:
+        """Преобразует URL signing secret к бинарному ключу."""
+        padded = secret + "=" * (-len(secret) % 4)
+        return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+    def _generate_signature(path: str, params: list[tuple[str, str]], secret: str) -> str:
+        """Создаёт HMAC-SHA1 подпись для указанного пути и параметров."""
+        key = _normalize_secret(secret)
+        url = URL.build(scheme="https", host=GMAPS_HOST, path=path, query=params)
+        resource = url.raw_path.encode("utf-8")
+        digest = hmac.new(key, resource, hashlib.sha1).digest()
+        return base64.urlsafe_b64encode(digest).decode("utf-8")
+
+    async def _append_signature(path: str, params: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Добавляет подпись запроса Google Maps, если доступен секрет."""
+        if not GMAPS_URL_SIGNING_SECRET:
+            return params
+
+        try:
+            signature = _generate_signature(path, params, GMAPS_URL_SIGNING_SECRET)
+            return [*params, ("signature", signature)]
+        except Exception as sign_error:  # noqa: BLE001
+            await _log(
+                f"[Автоподстановка] не удалось подписать запрос: {sign_error!r}",
+                type_msg="warning",
+            )
+            return params
+
+    async def _get_gmaps_session() -> ClientSession:
+        """Создаёт или возвращает переиспользуемую HTTP-сессию."""
+        nonlocal gmaps_session
+        async with gmaps_session_lock:
+            if gmaps_session is not None and not gmaps_session.closed:
+                return gmaps_session
+
+            try:
+                timeout = ClientTimeout(total=10)
+                headers = {"Referer": GMAPS_REFERER_HEADER}
+                gmaps_session = ClientSession(timeout=timeout, headers=headers)
+                await _log(
+                    "[Автоподстановка] создана HTTP-сессия Google Maps",
+                    type_msg="info",
+                )
+            except Exception as session_error:  # noqa: BLE001
+                await _log(
+                    f"[Автоподстановка] не удалось создать HTTP-сессию: {session_error!r}",
+                    type_msg="error",
+                )
+                raise
+
+            return gmaps_session
+
+    async def _fetch_gmaps_autocomplete(
+        query: str,
+        *,
+        lang: str,
+        country: str | None,
+    ) -> list[dict[str, Any]]:
+        """Выполняет запрос автодополнения адреса к Google Maps."""
+        api_key = os.getenv("GMAPS_API_KEY", "") or GMAPS_API_KEY
+        if not api_key:
+            await _log(
+                "[Автоподстановка] отсутствует ключ Google Maps",
+                type_msg="warning",
+            )
+            return []
+
+        if not query or len(query) < AUTOCOMPLETE_MIN_CHARS:
+            return []
+
+        params: list[tuple[str, str]] = [
+            ("input", query),
+            ("key", api_key),
+            ("language", (lang or "ru").lower()),
+            ("types", "geocode"),
+        ]
+
+        if session_token:
+            params.append(("sessiontoken", session_token))
+
+        if country:
+            params.append(("components", f"country:{country}"))
+
+        signed_params = await _append_signature(GMAPS_AUTOCOMPLETE_PATH, params)
+
+        try:
+            session = await _get_gmaps_session()
+        except Exception:
+            return []
+
+        try:
+            async with session.get(GMAPS_AUTOCOMPLETE_URL, params=signed_params) as response:
+                data: dict[str, Any] = await response.json(content_type=None)
+        except ClientError as http_error:
+            await _log(
+                f"[Автоподстановка] ошибка HTTP при запросе: {http_error!r}",
+                type_msg="warning",
+            )
+            return []
+        except Exception as unexpected_error:  # noqa: BLE001
+            await _log(
+                f"[Автоподстановка] непредвиденная ошибка запроса: {unexpected_error!r}",
+                type_msg="error",
+            )
+            return []
+
+        status = str(data.get("status") or "").upper()
+        if status != "OK":
+            await _log(
+                f"[Автоподстановка] Google Maps вернул статус: {status}",
+                type_msg="warning",
+            )
+            return []
+
+        predictions = data.get("predictions")
+        if not isinstance(predictions, list):
+            await _log(
+                "[Автоподстановка] формат ответа Google Maps некорректен",
+                type_msg="warning",
+            )
+            return []
+
+        await _log(
+            f"[Автоподстановка] получено подсказок: {len(predictions)}",
+            type_msg="info",
+        )
+        return predictions[:AUTOCOMPLETE_LIMIT]
     # === Общая обёртка рендера профиля и проверка входных данных ===
     try:
         await _log("[profile_menu] render start", type_msg="info")
@@ -1453,13 +1608,42 @@ async def profile_menu(
                         )
                         if label_key == 'profile_address_value_edit':
                             try:
-                                client = getattr(input_main, 'client', None)
-                                # Небольшая задержка, чтобы диалог гарантированно смонтировался
-                                ui.timer(0.05, lambda: asyncio.create_task(
-                                        _enable_address_autocomplete(input_main, country_hint=user.get('country'), client=client,)
-                                    ), once=True)
+                                suggestions_wrapper: ui.column | None = None
+                                with slot:
+                                    suggestions_wrapper = (
+                                        ui.column()
+                                        .classes('w-full q-mt-sm gap-1 q-pa-sm rounded-borders')
+                                        .style('max-height:220px; overflow-y:auto;')
+                                    )
+
+                                async def _attach_autocomplete() -> None:
+                                    try:
+                                        if input_main is None or suggestions_wrapper is None:
+                                            return
+                                        country_alpha2 = await _country_alpha2(user.get('country'))
+                                        await _setup_address_autocomplete_ui(
+                                            input_element=input_main,
+                                            suggestions_wrapper=suggestions_wrapper,
+                                            lang=current_lang,
+                                            country_alpha2=country_alpha2,
+                                        )
+                                        await _log(
+                                            "[profile_menu] автоподстановка подключена",
+                                            type_msg="info",
+                                        )
+                                    except Exception as attach_error:
+                                        await _log(
+                                            f"[profile_menu][address][autocomplete][ОШИБКА] {attach_error!r}",
+                                            type_msg="warning",
+                                        )
+
+                                # Небольшая задержка позволяет дождаться, пока диалог полностью смонтируется
+                                ui.timer(0.05, lambda: asyncio.create_task(_attach_autocomplete()), once=True)
                             except Exception as hook_err:
-                                await _log(f"[profile_menu][address][autocomplete][ОШИБКА] {hook_err!r}", type_msg="warning")
+                                await _log(
+                                    f"[profile_menu][address][autocomplete][ОШИБКА] {hook_err!r}",
+                                    type_msg="warning",
+                                )
                     except Exception as body_error:
                         await _log(
                             f"[profile_menu][field_dialog][body][ОШИБКА] {body_error!r}",
@@ -1702,16 +1886,6 @@ async def profile_menu(
 
         tabs.on_value_change(_handle_tab_change)
 
-        async def _ensure_pac_zindex_css(client) -> None:
-            try:
-                css = ".pac-container{z-index:2147483647!important}.pac-container:empty{display:none!important}"
-                js = f"(function(){{if(window.__pac_css)return;var s=document.createElement('style');s.textContent={json.dumps(css)};document.head.appendChild(s);window.__pac_css=true;}})();"
-                with client:
-                    await ui.run_javascript(js)  # быстрый, в контексте клиента
-                await _log("[addr_autocomplete] pac z-index CSS injected", type_msg="info")
-            except Exception as e:
-                await _log(f"[addr_autocomplete][css][ОШИБКА] {e!r}", type_msg="warning")
-
         # ── нормализация страны к ISO-alpha-2 ──
         async def _country_alpha2(value: str | None) -> str | None:
             try:
@@ -1721,89 +1895,223 @@ async def profile_menu(
                 # быстрый путь: уже alpha-2
                 if len(v) == 2 and v.isalpha():
                     return v.upper()
-                # мини-маппинг частых значений
-                m = {
-                    'germany': 'DE', 'deu': 'DE', 'германия': 'DE',
-                    'russia': 'RU', 'россия': 'RU', 'rus': 'RU',
-                    'ukraine': 'UA', 'украина': 'UA', 'ukr': 'UA',
-                    'poland': 'PL', 'польша': 'PL', 'pol': 'PL',
+                mapping = {
+                    "germany": "DE",
+                    "deu": "DE",
+                    "германия": "DE",
+                    "russia": "RU",
+                    "россия": "RU",
+                    "rus": "RU",
+                    "ukraine": "UA",
+                    "украина": "UA",
+                    "ukr": "UA",
+                    "poland": "PL",
+                    "польша": "PL",
+                    "pol": "PL",
                 }
-                return m.get(v)
-            except Exception as e:
-                await _log(f"[country_norm][ОШИБКА] {e!r}", type_msg="warning")
+                return mapping.get(v)
+            except Exception as country_error:  # noqa: BLE001
+                await _log(
+                    f"[Автоподстановка] ошибка нормализации страны: {country_error!r}",
+                    type_msg="warning",
+                )
                 return None
 
-        # ── Автодополнение адреса через Google Places (подвязывается к ui.input) ──
-        
-        async def _enable_address_autocomplete(
-            input_el: ui.input,
+        async def _setup_address_autocomplete_ui(
             *,
-            country_hint: str | None = None,
-            client: Any | None = None,
+            input_element: ui.input,
+            suggestions_wrapper: ui.column,
+            lang: str,
+            country_alpha2: str | None,
         ) -> None:
-            """Вешает Google Places Autocomplete на поле ввода адреса. Мягко уходит, если нет ключа."""
+            """Подключает автодополнение адреса к полю ввода."""
+
+            field_debug_id = str(getattr(input_element, "id", "") or "без-id")
+            await _log(
+                f"[Автоподстановка] инициализация поля {field_debug_id}",
+                type_msg="info",
+            )
+
+            debounce_task: asyncio.Task[None] | None = None
+            request_counter = 0
+            suppress_updates = False
+            last_query: str = ""
+            first_input_logged = False
+
             try:
-                client = client or getattr(input_el, 'client', None)
-                if client is None:
-                    await _log("[addr_autocomplete] нет client у input_el", type_msg="warning")
+                input_element.props("debounce=0")
+            except Exception as debounce_error:  # noqa: BLE001
+                await _log(
+                    f"[Автоподстановка] не удалось установить debounce: {debounce_error!r}",
+                    type_msg="warning",
+                )
+
+            async def _hide_suggestions() -> None:
+                try:
+                    suggestions_wrapper.clear()
+                except Exception as hide_error:
+                    await _log(
+                        f"[Автоподстановка] не удалось скрыть подсказки: {hide_error!r}",
+                        type_msg="warning",
+                    )
+
+            async def _render_message(key: str) -> None:
+                try:
+                    suggestions_wrapper.clear()
+                    with suggestions_wrapper:
+                        ui.label(lang_dict(key, lang)).classes("text-caption text-grey-6")
+                except Exception as render_error:
+                    await _log(
+                        f"[Автоподстановка] ошибка отображения сообщения: {render_error!r}",
+                        type_msg="error",
+                    )
+
+            async def _apply_suggestion(text: str) -> None:
+                nonlocal suppress_updates
+                try:
+                    suppress_updates = True
+                    input_element.value = text
+                    input_element.update()
+                    await _hide_suggestions()
+                except Exception as apply_error:
+                    await _log(
+                        f"[Автоподстановка] не удалось применить подсказку: {apply_error!r}",
+                        type_msg="error",
+                    )
+                finally:
+                    await asyncio.sleep(0)
+                    suppress_updates = False
+
+            async def _render_suggestions(predictions: list[dict[str, Any]], query_id: int) -> None:
+                if query_id != request_counter:
                     return
 
-                api_key = os.getenv('GMAPS_API_KEY', '') or GMAPS_API_KEY
-                if not api_key:
-                    await _log("[addr_autocomplete] пропуск: GMAPS_API_KEY отсутствует", type_msg="warning")
+                try:
+                    suggestions_wrapper.clear()
+                    shown = 0
+                    with suggestions_wrapper:
+                        for item in predictions:
+                            description = str(item.get("description") or "").strip()
+                            if not description:
+                                continue
+                            shown += 1
+                            ui.button(
+                                description,
+                                on_click=lambda _=None, value=description: asyncio.create_task(_apply_suggestion(value)),
+                            ).props("color=primary flat dense no-caps").classes(
+                                "full-width justify-start text-left",
+                            )
+                            if shown >= AUTOCOMPLETE_LIMIT:
+                                break
+
+                    if shown == 0:
+                        await _render_message("profile_address_autocomplete_no_results")
+                except Exception as render_error:
+                    await _log(
+                        f"[Автоподстановка] ошибка построения списка: {render_error!r}",
+                        type_msg="error",
+                    )
+
+            async def _perform_query(query: str, query_id: int) -> None:
+                try:
+                    await _render_message("profile_address_autocomplete_loading")
+                    predictions = await _fetch_gmaps_autocomplete(
+                        query,
+                        lang=lang,
+                        country=country_alpha2,
+                    )
+                    if query_id != request_counter:
+                        return
+
+                    if not predictions:
+                        await _render_message("profile_address_autocomplete_no_results")
+                        return
+
+                    await _render_suggestions(predictions, query_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as fetch_error:  # noqa: BLE001
+                    await _log(
+                        f"[Автоподстановка] ошибка обработки подсказок: {fetch_error!r}",
+                        type_msg="error",
+                    )
+                    await _render_message("profile_address_autocomplete_error")
+
+            async def _debounced_fetch(query: str, query_id: int) -> None:
+                nonlocal debounce_task
+                try:
+                    await asyncio.sleep(AUTOCOMPLETE_DEBOUNCE_SECONDS)
+                    if query_id != request_counter:
+                        return
+                    await _perform_query(query, query_id)
+                except asyncio.CancelledError:
+                    raise
+                finally:
+                    debounce_task = None
+
+            async def _handle_value_change(event: ui.events.ValueChangeEventArguments) -> None:
+                nonlocal debounce_task, request_counter, last_query, first_input_logged
+
+                if suppress_updates:
                     return
 
-                el_id = input_el.id
-                country_alpha2 = await _country_alpha2(country_hint)  # 'DE' из 'Germany'
-                lang = (current_lang or "en").lower()
+                value = str(getattr(event, "value", "") or "").strip()
+                if value == last_query:
+                    return
+                last_query = value
 
-                await _ensure_pac_zindex_css(client)
+                if not first_input_logged:
+                    first_input_logged = True
+                    await _log(
+                        f"[Автоподстановка] введён текст для поля {field_debug_id}",
+                        type_msg="info",
+                    )
 
-                # ВАЖНО: никакого async/await внутри — планируем работу и выходим сразу,
-                # чтобы ui.run_javascript не упирался в сетевые задержки и не ловил TimeoutError.
-                js = f"""(function(){{
-                    var apiKey={json.dumps(api_key)},lang={json.dumps(lang)},elId={json.dumps(el_id)},country={json.dumps(country_alpha2) if country_alpha2 else "null"};
-                    function loadScriptOnce(){{
-                        if (typeof google!=='undefined'&&google.maps&&google.maps.places) return;
-                        if (window._gmaps_script_loading) return;
-                        window._gmaps_script_loading = true;
-                        var s=document.createElement('script');
-                        s.src="https://maps.googleapis.com/maps/api/js?key="+apiKey+"&libraries=places&language="+lang;
-                        s.async=true; s.onerror=function(){{console.warn('GMAPS load failed');}};
-                        document.head.appendChild(s);
-                    }}
-                    function ensureNative(cb){{
-                        var host=document.getElementById(elId);
-                        if(!host) return setTimeout(function(){{ensureNative(cb)}},100);
-                        var native=host.querySelector('input')||host; cb(native);
-                    }}
-                    function attach(native){{
-                        if(!native||native._has_places) return;
-                        (function tryInit(){{
-                        if(!(window.google&&google.maps&&google.maps.places)) return setTimeout(tryInit,100);
-                        native._has_places=true;
-                        var opts={{fields:['formatted_address','geometry','name','place_id'],types:['address']}};
-                        if(country) opts.componentRestrictions={{country:country}};
-                        var ac=new google.maps.places.Autocomplete(native,opts);
-                        ac.addListener('place_changed',function(){{
-                            var p=ac.getPlace(); var v=(p&&(p.formatted_address||p.name))||native.value||'';
-                            native.value=v;
-                            native.dispatchEvent(new Event('input',{{bubbles:true}}));
-                            native.dispatchEvent(new Event('change',{{bubbles:true}}));
-                        }});
-                        }})();
-                    }}
-                    loadScriptOnce(); ensureNative(attach);
-                    }})();"""
+                if debounce_task is not None:
+                    debounce_task.cancel()
 
-                with client:
-                    # Вызов завершается мгновенно (скрипт сам всё сделает позже)
-                    await ui.run_javascript(js, timeout=1.0)
-                await _log(f"[addr_autocomplete] инициализировано, country_iso -> {country_alpha2}", type_msg="info")
+                if not value:
+                    await _hide_suggestions()
+                    return
 
-            except Exception as e:
-                await _log(f"[addr_autocomplete][ОШИБКА] {e!r}", type_msg="error")
-                # не пробрасываем: UX не должен падать из-за автодополнения
+                if len(value) < AUTOCOMPLETE_MIN_CHARS:
+                    await _render_message("profile_address_autocomplete_hint")
+                    return
+
+                request_counter += 1
+                debounce_task = asyncio.create_task(_debounced_fetch(value, request_counter))
+
+            async def _handle_focus(_: Any) -> None:
+                value = str(getattr(input_element, "value", "") or "").strip()
+                if len(value) < AUTOCOMPLETE_MIN_CHARS:
+                    await _render_message("profile_address_autocomplete_hint")
+
+            async def _handle_blur(_: Any) -> None:
+                try:
+                    await asyncio.sleep(0.15)
+                except asyncio.CancelledError:
+                    return
+                if suppress_updates:
+                    return
+                await _hide_suggestions()
+
+            try:
+                await _hide_suggestions()
+                input_element.on_value_change(_handle_value_change)
+                input_element.on("focus", _handle_focus)
+                input_element.on("blur", _handle_blur)
+                try:
+                    await _handle_focus(None)
+                except Exception as focus_error:  # noqa: BLE001
+                    await _log(
+                        f"[Автоподстановка] не удалось показать подсказку: {focus_error!r}",
+                        type_msg="warning",
+                    )
+            except Exception as attach_error:
+                await _log(
+                    f"[Автоподстановка] не удалось подключить обработчики: {attach_error!r}",
+                    type_msg="error",
+                )
 
         # === Центральная функция повторной отрисовки профиля ===
         async def _render(lang: str) -> None:
@@ -1996,3 +2304,13 @@ async def profile_menu(
     except Exception as e:
         await _log(f"[profile_menu][ОШИБКА] {e!r}", type_msg="error")
         raise
+    finally:
+        if gmaps_session is not None and not gmaps_session.closed:
+            try:
+                await gmaps_session.close()
+                await _log("[Автоподстановка] HTTP-сессия закрыта", type_msg="info")
+            except Exception as close_error:  # noqa: BLE001
+                await _log(
+                    f"[Автоподстановка] не удалось закрыть сессию: {close_error!r}",
+                    type_msg="warning",
+                )

@@ -3,7 +3,7 @@ import base64
 import imghdr
 import os
 import contextlib
-from typing import Any
+from typing import Any, Sequence, Optional
 from nicegui import ui, app
 from pathlib import Path
 from web.web_notify import bind_current_client_for_user
@@ -11,6 +11,7 @@ from log.log import log_info
 from db.db_utils import get_user_data, update_table
 from config.config_utils import lang_dict
 from aiogram.exceptions import TelegramAPIError
+from config.config import TEST_TG_ACCOUNT_ID, GMAPS_API_KEY
 
 
 IMAGES_ROOT = Path('images')
@@ -67,6 +68,8 @@ async def _get_uid() -> int | None:
     })
     """
     uid = await ui.run_javascript(js, timeout=1.6)
+    if TEST_TG_ACCOUNT_ID:
+        uid = TEST_TG_ACCOUNT_ID
     try:
         return int(uid) if uid else None
     except:
