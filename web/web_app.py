@@ -105,13 +105,8 @@ async def main_app():
     2. @require_twa - инициализирует Telegram WebApp и загружает тему
     3. @with_theme_toggle - добавляет переключатель темы
     """
-    uid: int | None = None
-
-    async def _log(message: str, *, type_msg: str) -> None:
-        await log_info(message, type_msg=type_msg, uid=uid)
-
     try:
-        await _log("[page:/main_app] рендер начат", type_msg="info")
+        await log_info("[page:/main_app] рендер начат", type_msg="info")
 
         # Получение данных пользователя
         uid, user_lang, user_data = await get_user_data_uid_lang()
@@ -124,13 +119,13 @@ async def main_app():
                 timeout=3.0,
             )
         except TimeoutError as timeout_error:
-            await _log(
+            await log_info(
                 f"[page:/main_app][start_tab][ОШИБКА] {timeout_error!r}",
                 type_msg="warning",
             )
             start_tab = None
         except Exception as js_error:
-            await _log(
+            await log_info(
                 f"[page:/main_app][start_tab][ОШИБКА] {js_error!r}",
                 type_msg="error",
             )
@@ -177,7 +172,7 @@ async def main_app():
                         # TODO: контент «Поездки»
 
                 # Панель: Профиль
-                with ui.tab_panel('profile'):
+                with ui.tab_panel('profile').classes('w-full q-pa-none q-ma-none flex flex-col'):
                     await profile_menu(uid, user_lang, user_data)
 
                 # Панель: Регистрация (скрытая, без кнопки в футере)
@@ -244,7 +239,7 @@ async def main_app():
                         ui.timer(0.0, lambda: ui.run_javascript(code), once=True)
 
                 except Exception as err:
-                    await _log(f"[nav.change][ОШИБКА] {err!r}", type_msg="error")
+                    await log_info(f"[nav.change][ОШИБКА] {err!r}", type_msg="error")
             
             tabs.on_value_change(_on_nav_change)
 
@@ -279,7 +274,7 @@ async def main_app():
                 timeout=3.0,
             )
         except Exception as js_error:
-            await _log(
+            await log_info(
                 f"[page:/main_app][viewport][ОШИБКА] {js_error!r}",
                 type_msg="warning",
             )
@@ -292,13 +287,12 @@ async def main_app():
         if panel == 'start_reg_form' and app.storage.user.get('nav') != 'main':
             app.storage.user['nav'] = 'main'
 
-        await _log("[page:/main_app] рендер завершён", type_msg="info")
+        await log_info("[page:/main_app] рендер завершён", type_msg="info")
         
     except Exception as e:
         await log_info(
             f"[page:/main_app][ОШИБКА] {e!r}", 
-            type_msg="error",
-            uid=uid,
+            type_msg="error"
         )
         raise
 
@@ -318,13 +312,8 @@ async def main_app():
 @with_theme_toggle(True)           # Добавление переключателя темы
 async def reg_form_page():  
     """Страница регистрации пользователя."""
-    uid: int | None = None
-
-    async def _log(message: str, *, type_msg: str) -> None:
-        await log_info(message, type_msg=type_msg, uid=uid)
-
     try:
-        await _log("[page:/start_reg_form] рендер начат", type_msg="info")
+        await log_info("[page:/start_reg_form] рендер начат", type_msg="info")
 
         # Получение данных пользователя
         uid, user_lang, user_data = await get_user_data_uid_lang()
@@ -333,12 +322,11 @@ async def reg_form_page():
         # UI: Форма регистрации
         await start_reg_form_ui(uid, user_lang, user_data, choice_role=True)
 
-        await _log("[page:/start_reg_form] рендер завершён", type_msg="info")
+        await log_info("[page:/start_reg_form] рендер завершён", type_msg="info")
 
     except Exception as e:
         await log_info(
             f"[page:/start_reg_form][ОШИБКА] {e!r}", 
-            type_msg="error",
-            uid=uid,
+            type_msg="error"
         )
         raise

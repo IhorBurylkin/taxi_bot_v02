@@ -2,12 +2,13 @@ import asyncio
 import base64
 import imghdr
 import os
-
+import contextlib
+from typing import Any
 from nicegui import ui, app
 from pathlib import Path
 from web.web_notify import bind_current_client_for_user
 from log.log import log_info
-from db.db_utils import get_user_data
+from db.db_utils import get_user_data, update_table
 from config.config_utils import lang_dict
 from aiogram.exceptions import TelegramAPIError
 
@@ -22,6 +23,12 @@ DEFAULT_AVATAR_DATA_URL = (
   "<path d='M32 112c0-19 15-34 34-34s34 15 34 34' fill='%23B6BCC6'/>"
   "</svg>"
 )
+
+docs_spec: list[tuple[str, str, str]] = [
+    ("car_image", "profile_vehicle_car_photo", "car"),
+    ("techpass_image", "profile_vehicle_techpass", "techpass"),
+    ("driver_license", "profile_vehicle_license", "driver_license"),
+]
 
 def _digits(s: str) -> str: return ''.join(ch for ch in (s or '') if ch.isdigit())
 
@@ -65,77 +72,123 @@ async def _get_uid() -> int | None:
     except:
         return None
 
-async def _save_upload(uid: int, e, kind: str, progress=None) -> str:
-    """Сохранение аплоада: поддерживает NiceGUI v2 (e.name/e.content) и v3 (e.file)."""
+# Допустимые расширения для сохранения файлов
+ALLOWED_UPLOAD_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.pdf'}
+
+
+async def _save_upload(uid: int, e, kind: str, progress=None, lang: str | None = None) -> str:
+  """Сохранение аплоада: поддерживает NiceGUI v2 (e.name/e.content) и v3 (e.file)."""
+  safe_lang = (lang or 'en')
+  ext_hint = ', '.join(sorted(ALLOWED_UPLOAD_EXT))
+
+  try:
     IMAGES_ROOT.mkdir(exist_ok=True)
     user_dir = IMAGES_ROOT / str(uid)
     user_dir.mkdir(parents=True, exist_ok=True)
 
     # --- v3 API ---
     if hasattr(e, 'file') and e.file is not None:
-        fobj = e.file                              # FileUpload
-        name = fobj.name or f'{kind}.bin'
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in {'.jpg', '.jpeg', '.png', '.webp', '.pdf'}:
-            raise ValueError('Недопустимый тип файла')
-        path = user_dir / f'{kind}{ext}'
+      fobj = e.file  # FileUpload
+      name = fobj.name or f'{kind}.bin'
+      ext = os.path.splitext(name)[1].lower()
+      if ext not in ALLOWED_UPLOAD_EXT:
+        await log_info(
+          f"[_save_upload] запрещённое расширение {ext} для kind={kind}",
+          type_msg="warning",
+          uid=uid,
+        )
+        raise ValueError(lang_dict('upload_error_invalid_type', safe_lang, exts=ext_hint))
+      path = user_dir / f'{kind}{ext}'
 
-        # потоковая запись с прогрессом
-        get_sz = getattr(fobj, 'size', None)
-        total = get_sz() if callable(get_sz) else (int(get_sz) if get_sz is not None else None)
+      # потоковая запись с прогрессом
+      get_sz = getattr(fobj, 'size', None)
+      total = get_sz() if callable(get_sz) else (int(get_sz) if get_sz is not None else None)
 
-        written = 0
-        with open(path, 'wb') as dst:
-            async for chunk in fobj.iterate():     # 3.x: побайтовый итератор
-                dst.write(chunk)
-                if total and progress is not None:
-                    written += len(chunk)
-                    progress.value = written / total
-                    await asyncio.sleep(0)
-        return str(path)
+      written = 0
+      with open(path, 'wb') as dst:
+        async for chunk in fobj.iterate():  # 3.x: побайтовый итератор
+          dst.write(chunk)
+          if total and progress is not None:
+            written += len(chunk)
+            progress.value = written / total
+            await asyncio.sleep(0)
+      await log_info(
+        f"[_save_upload] файл {path.name} сохранён (v3)",
+        type_msg="info",
+        uid=uid,
+      )
+      return str(path)
 
     # --- v2 API (fallback) ---
     name = getattr(e, 'name', f'{kind}.bin')
     ext = os.path.splitext(name)[1].lower()
-    if ext not in {'.jpg', '.jpeg', '.png', '.webp', '.pdf'}:
-        raise ValueError('Недопустимый тип файла')
+    if ext not in ALLOWED_UPLOAD_EXT:
+      await log_info(
+        f"[_save_upload] запрещённое расширение {ext} для kind={kind}",
+        type_msg="warning",
+        uid=uid,
+      )
+      raise ValueError(lang_dict('upload_error_invalid_type', safe_lang, exts=ext_hint))
     path = user_dir / f'{kind}{ext}'
 
     src = getattr(e, 'content', None)
     if src is None:
-        raise ValueError('Пустой контент файла')
+      await log_info(
+        f"[_save_upload] пустой контент для kind={kind}",
+        type_msg="warning",
+        uid=uid,
+      )
+      raise ValueError(lang_dict('upload_error_empty', safe_lang))
 
     try:
-        src.seek(0, os.SEEK_END); total = src.tell(); src.seek(0)
+      src.seek(0, os.SEEK_END)
+      total = src.tell()
+      src.seek(0)
     except Exception:
-        total = None
+      total = None
 
     copied = 0
-    CHUNK = 256 * 1024
+    chunk_size = 256 * 1024
     with open(path, 'wb') as dst:
-        while True:
-            chunk = src.read(CHUNK)
-            if not chunk:
-                break
-            dst.write(chunk)
-            if total and progress is not None:
-                copied += len(chunk)
-                progress.value = copied / total
-                await asyncio.sleep(0)
+      while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+          break
+        dst.write(chunk)
+        if total and progress is not None:
+          copied += len(chunk)
+          progress.value = copied / total
+          await asyncio.sleep(0)
     try:
-        src.close()
+      src.close()
     except Exception:
-        pass
+      pass
+
+    await log_info(
+      f"[_save_upload] файл {path.name} сохранён (v2)",
+      type_msg="info",
+      uid=uid,
+    )
     return str(path)
 
+  except ValueError:
+    raise
+  except Exception as error:
+    await log_info(
+      f"[_save_upload][ОШИБКА] {error!r}",
+      type_msg="error",
+      uid=uid,
+    )
+    raise ValueError(lang_dict('upload_error_save', safe_lang)) from error
 
-def bind_enter_action(src, dst=None, close=False):
-    src_id = getattr(src, 'id', None)
-    dst_id = getattr(dst, 'id', None)
-    if not src_id:
-        return
 
-    js = """
+async def bind_enter_action(src, dst=None, close=False):
+  src_id = getattr(src, 'id', None)
+  dst_id = getattr(dst, 'id', None)
+  if not src_id:
+    return
+
+  js = """
 (() => {
   const SRC_ID = __SRC__;
   const DST_ID = __DST__;
@@ -254,10 +307,18 @@ def bind_enter_action(src, dst=None, close=False):
   }
 })();
 """
-    js = js.replace('__SRC__', str(src_id))
-    js = js.replace('__DST__', 'null' if dst_id is None else str(dst_id))
-    js = js.replace('__CLOSE__', 'true' if (close or dst_id is None) else 'false')
-    ui.run_javascript(js)
+  js = js.replace('__SRC__', str(src_id))
+  js = js.replace('__DST__', 'null' if dst_id is None else str(dst_id))
+  js = js.replace('__CLOSE__', 'true' if (close or dst_id is None) else 'false')
+
+  try:
+    await ui.run_javascript(js)
+  except Exception as bind_error:
+    await log_info(
+      f"[bind_enter_action] ошибка выполнения JS: {bind_error!r}",
+      type_msg="error",
+    )
+    raise
 
 
 async def fetch_telegram_avatar(uid: int) -> str:
@@ -428,3 +489,95 @@ async def get_user_data_uid_lang():
       uid=uid,
     )
     return None, fallback_lang, None
+  
+def _is_filled(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return bool(val.strip())
+    if isinstance(val, (list, tuple, set, dict)):
+        return len(val) > 0
+    return True
+
+async def verify_driver(uid: int) -> bool:
+    """
+    True  -> все обязательные поля заполнены И verified_driver==True в БД.
+    False -> иначе. Если поля не ок, а в БД стоит True — сбрасываем verified_driver=False.
+    Логи: полностью на русском.
+    """
+    import contextlib
+    from typing import Any
+
+    try:
+        await log_info(f"[verify_driver] старт проверки: uid={uid}", type_msg="info", user_id=uid)
+
+        user = await get_user_data("users", uid)
+        if not user:
+            await log_info("[verify_driver] запись пользователя не найдена", type_msg="warning", user_id=uid)
+            # консистентность: на всякий случай пометим False
+            with contextlib.suppress(Exception):
+                await update_table("users", uid, {"verified_driver": False})
+            return False
+
+        # распарсим spec (3/4 значения), required по умолчанию True
+        required_keys: list[str] = []
+        for item in docs_spec:
+            if not isinstance(item, tuple) or len(item) not in (3, 4):
+                await log_info(f"[verify_driver] пропуск некорректного элемента спецификации: {item!r}",
+                               type_msg="warning", user_id=uid)
+                continue
+            key = item[0]
+            required = item[3] if len(item) == 4 else True
+            if required:
+                required_keys.append(key)
+
+        if not required_keys:
+            await log_info("[verify_driver] нет обязательных полей для проверки → False",
+                           type_msg="warning", user_id=uid)
+            with contextlib.suppress(Exception):
+                await update_table("users", uid, {"verified_driver": False})
+            return False
+
+        # проверка заполненности
+        missing = [k for k in required_keys if not _is_filled(user.get(k))]
+        for k in required_keys:
+            filled = "-> Ok" if k not in missing else "-> empty"
+            await log_info(f"[verify_driver] поле {k}: {filled}", type_msg="info", user_id=uid)
+
+        docs_ok = len(missing) == 0
+        verified_db = bool(user.get("verified_driver") is True)
+        await log_info(
+            f"[verify_driver] итог по документам: {'все заполнены' if docs_ok else f'пропуски: {missing}'}; "
+            f"флаг в БД verified_driver={verified_db}",
+            type_msg="info",
+            user_id=uid,
+        )
+
+        # финальная логика
+        if docs_ok and verified_db:
+            await log_info("[verify_driver] УСПЕХ: документы ок и verified_driver=True → True",
+                           type_msg="info", user_id=uid)
+            return True
+
+        if docs_ok and not verified_db:
+            await log_info("[verify_driver] документы ок, но verified_driver=False → False",
+                           type_msg="info", user_id=uid)
+            return False
+
+        if not docs_ok and verified_db:
+            await log_info("[verify_driver] обнаружены пустые поля, сбрасываем verified_driver=False → False",
+                           type_msg="warning", user_id=uid)
+            with contextlib.suppress(Exception):
+                await update_table("users", uid, {"verified_driver": False})
+            return False
+
+        await log_info("[verify_driver] документы не ок и verified_driver=False → False",
+                       type_msg="info", user_id=uid)
+        return False
+
+    except Exception as e:
+        await log_info(f"[verify_driver] ОШИБКА: {e!r}. Устанавливаем verified_driver=False → False",
+                       type_msg="error", user_id=uid)
+        with contextlib.suppress(Exception):
+            await update_table("users", uid, {"verified_driver": False})
+        return False

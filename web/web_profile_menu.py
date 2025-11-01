@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import json
 import time
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
@@ -11,12 +14,19 @@ from web.web_utilits import (
     DEFAULT_AVATAR_DATA_URL,
     bind_enter_action,
     fetch_telegram_avatar,
+    _save_upload,
+    verify_driver
 )
 
 from log.log import log_info
 from config.config import SUPPORTED_LANGUAGE_NAMES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES
 from config.config_utils import lang_dict
 from db.db_utils import delete_user, update_table
+
+try:  # Pillow может отсутствовать в среде
+    from PIL import Image  # type: ignore
+except ImportError:  # pragma: no cover - работа без Pillow
+    Image = None  # type: ignore
 
 SECTION_TITLE_KEYS: dict[str, str] = {
     "personal_data": "profile_personal_title",
@@ -260,16 +270,24 @@ async def profile_menu(
         tabs = (ui.tabs(value='profile_list')
                 .props('dense no-caps align=justify narrow-indicator '
                        'active-color=primary indicator-color=primary')
-                .classes('hidden w-full')
+                .classes('hidden w-full h-full')
         )
-        root = ui.column().classes("w-full q-pa-none q-pt-none q-gutter-y-none").style(
-                # занимаем весь экран; dvh корректно работает на мобилках
-                "min-height:100dvh; height:100dvh; max-height:100dvh;"
-                # на всю ширину без горизонтального скролла
+        root = (
+            ui.column()
+            .classes("w-full window-height q-mt-md q-mb-none q-ml-none q-mr-none q-pa-none")
+            .style(
+                "height:100%; max-height:150%;"
                 "width:100%; max-width:100%;"
-                # flex-колонка и управление прокруткой содержимого
-                "display:flex; flex-direction:column; overflow-y:auto; overflow-x:hidden;"
-            )
+                "display:flex; flex-direction:column; overflow-x:hidden;")
+        )
+            #.style(
+            #     # занимаем весь экран; dvh корректно работает на мобилках
+            #     "min-height:100dvh; height:100dvh; max-height:200dvh;"
+            #     # на всю ширину без горизонтального скролла
+            #     "width:100%; max-width:100%;"
+            #     # flex-колонка и управление прокруткой содержимого
+            #     "display:flex; flex-direction:column; overflow-y:hidden; overflow-x:hidden;"
+            # )
 
         registration_dialog: ui.dialog | None = None
         reg_container: Any | None = None
@@ -278,30 +296,30 @@ async def profile_menu(
             """Применяет тему через готовую реализацию на фронте."""
             try:
                 js = f"""
-if (window.__syncing_theme_toggle) return;
-const desired = '{mode}';
-const dark = desired === 'dark';
-try {{ window.Quasar?.Dark?.set?.(dark); }} catch {{}}
-const body = document.body;
-body.classList.toggle('body--dark', dark);
-body.classList.toggle('body--light', !dark);
-const bg = dark ? '#0b0b0c' : '#ffffff';
-try {{
-  document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
-  document.documentElement.style.backgroundColor = bg;
-  body.style.backgroundColor = bg;
-  window.Telegram?.WebApp?.setBackgroundColor?.(bg);
-}} catch {{}}
-try {{
-  const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
-  inputs.forEach(el => {{ el.style.webkitTextFillColor = getComputedStyle(el).color; }});
-}} catch {{}}
-const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || localStorage.getItem('tg_user_id');
-if (uid) {{
-  const blob = new Blob([JSON.stringify({{ user_id: uid, theme: desired }})], {{type: 'application/json'}});
-  navigator.sendBeacon('/api/theme', blob);
-}}
-"""
+                if (window.__syncing_theme_toggle) return;
+                const desired = '{mode}';
+                const dark = desired === 'dark';
+                try {{ window.Quasar?.Dark?.set?.(dark); }} catch {{}}
+                const body = document.body;
+                body.classList.toggle('body--dark', dark);
+                body.classList.toggle('body--light', !dark);
+                const bg = dark ? '#0b0b0c' : '#ffffff';
+                try {{
+                document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
+                document.documentElement.style.backgroundColor = bg;
+                body.style.backgroundColor = bg;
+                window.Telegram?.WebApp?.setBackgroundColor?.(bg);
+                }} catch {{}}
+                try {{
+                const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
+                inputs.forEach(el => {{ el.style.webkitTextFillColor = getComputedStyle(el).color; }});
+                }} catch {{}}
+                const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || localStorage.getItem('tg_user_id');
+                if (uid) {{
+                const blob = new Blob([JSON.stringify({{ user_id: uid, theme: desired }})], {{type: 'application/json'}});
+                navigator.sendBeacon('/api/theme', blob);
+                }}
+                """
                 await ui.run_javascript(js)
             except Exception as theme_error:
                 await _log(
@@ -341,9 +359,9 @@ if (uid) {{
                 with reg_container:
                     # Верхняя панель с «X» справа
                     with ui.row().classes(
-                        "w-full items-center no-wrap q-pa-none q-mb-none"
+                        "w-full items-center wrap q-pa-none q-mb-none"
                     ):
-                        ui.space()
+                        ui.element("div").classes("flex-1")
                         ui.button(
                             icon="close",
                             on_click=_close_registration,
@@ -379,6 +397,7 @@ if (uid) {{
                         "car_number",
                         "car_image",
                         "techpass_image",
+                        "driver_license",
                     )
                     missing = [f for f in required_fields if not user.get(f)]
                     if missing:
@@ -473,15 +492,18 @@ if (uid) {{
             icon_name: str | None,
             label_key: str,
             value: str | None,
-            on_click: Callable[[Any], Awaitable[None]] | None = None,
+            on_click: Callable[[Any], Awaitable[None]] | None,
+            caption_key: str | None = None,
         ) -> ui.element:
             """Одна строка 'Иконка — Значение ..... Подпись'. Возвращает row; опционально навешивает клик."""
-            row = ui.row().classes("w-full items-center no-wrap q-px-none cursor-pointer")
+            row = ui.row().classes("w-full items-center wrap q-px-none q-py-lg cursor-pointer")
             with row:
                 if icon_name:
                     ui.icon(icon_name).classes("text-body1")
-                ui.label(_display_value(value, current_lang)).classes("text-body1")
-                ui.space()
+                if caption_key:
+                    ui.label(f"{lang_dict(caption_key, current_lang)}:").classes('text-body1')
+                ui.label(_display_value(value, current_lang)).classes("text-body1").style("white-space:normal; word-break:break-word;")
+                ui.element("div").classes("flex-1")
                 ui.label(lang_dict(label_key, current_lang)).classes('text-caption text-grey-6')
             if on_click:
                 row.on("click", on_click)
@@ -696,43 +718,293 @@ if (uid) {{
 
         async def _render_car(content: ui.element) -> None:
             try:
+                async def _prepare_preview(path: str | None) -> str | None:
+                    """Готовим сжатую копию для предпросмотра, если это изображение."""
+                    if not path:
+                        return None
+                    original = Path(path)
+                    if not original.exists():
+                        await _log(f"[profile_menu][car][preview] файл отсутствует: {path}", type_msg="warning")
+                        return None
+                    if original.suffix.lower() == '.pdf':
+                        return str(original)
+                    if Image is None:
+                        await _log("[profile_menu][car][preview] Pillow недоступен, отдаём оригинал", type_msg="warning")
+                        return str(original)
+                    try:
+                        preview = original.with_name(f"{original.stem}_preview.jpg")
+                        if (not preview.exists()) or (preview.stat().st_mtime < original.stat().st_mtime):
+                            with Image.open(original) as img:  # type: ignore[arg-type]
+                                img = img.convert('RGB')
+                                img.thumbnail((1024, 1024))  # сжимаем максимально для быстрой загрузки
+                                img.save(preview, format='JPEG', optimize=True, quality=40)
+                        return str(preview)
+                    except Exception as preview_error:
+                        await _log(f"[profile_menu][car][preview][ОШИБКА] {preview_error!r}", type_msg="warning")
+                        return str(original)
+
+                async def _open_vehicle_field_dialog(
+                    field: str,
+                    label_key: str,
+                    transform: Callable[[str], str] | None = None,
+                ) -> None:
+                    async def _updates_factory(value: str, _second: str | None) -> dict[str, Any]:
+                        cleaned = (value or '').strip()
+                        if transform is not None:
+                            cleaned = transform(cleaned)
+                        if not cleaned:
+                            raise ValueError('profile_vehicle_field_required')
+                        return {field: cleaned}
+
+                    await _open_input_dialog(
+                        initial_value=user.get(field) or '',
+                        label_key=label_key,
+                        action_key='profile_driver_vehicle_save',
+                        updates_factory=_updates_factory,
+                        section='car_data',
+                        ok_key='profile_driver_vehicle_updated',
+                        err_key='profile_driver_vehicle_update_error',
+                    )
+
+                async def _show_image_dialog(field: str, title_key: str) -> None:
+                    path = user.get(field)
+                    preview = await _prepare_preview(path)
+                    if not preview:
+                        ui.notify(lang_dict('profile_vehicle_image_missing', current_lang), type='warning')
+                        return
+
+                    async def _render_body(slot: ui.element) -> None:
+                        try:
+                            with slot:
+                                ui.label(lang_dict(title_key, current_lang)).classes('text-subtitle1')
+                                if preview.lower().endswith('.pdf'):
+                                    ui.label(lang_dict('profile_vehicle_pdf_hint', current_lang)).classes('text-body2 text-grey')
+                                    ui.button(
+                                        lang_dict('profile_vehicle_pdf_open', current_lang),
+                                        on_click=lambda _: ui.run_javascript(f"window.open('{preview}', '_blank')"),
+                                    ).props('color=primary flat')
+                                else:
+                                    ui.image(preview).classes('w-full').style('max-height:70vh; object-fit:contain; border-radius:8px;')
+                        except Exception as dialog_body_error:
+                            await _log(f"[profile_menu][car][preview_body][ОШИБКА] {dialog_body_error!r}", type_msg='error')
+                            raise
+
+                    await show_action_dialog(
+                        lang=current_lang,
+                        actions=[('profile_vehicle_image_close', None)],
+                        body_renderer=_render_body,
+                        persistent=True,
+                        maximized=False,
+                    )
+
+                async def _confirm_remove_image(field: str, title_key: str) -> None:
+                    async def _render_body(slot: ui.element) -> None:
+                        with slot:
+                            ui.label(lang_dict('profile_vehicle_image_remove_confirm', current_lang)).classes('text-body1')
+                            ui.label(lang_dict(title_key, current_lang)).classes('text-caption text-grey')
+
+                    async def _remove(_: Any | None = None) -> None:
+                        await _save(
+                            updates={field: None},
+                            section='car_data',
+                            ok_key='profile_vehicle_image_removed',
+                            err_key='profile_vehicle_image_remove_error',
+                        )
+
+                    await show_action_dialog(
+                        lang=current_lang,
+                        actions=[
+                            ('profile_vehicle_image_remove', _remove),
+                            ('profile_support_cancel', None),
+                        ],
+                        body_renderer=_render_body,
+                        danger_keys={'profile_vehicle_image_remove'},
+                    )
+
                 with content:
-                    with ui.card().classes('w-full q-pa-md gap-2'):
-                        _kv('profile_car_brand', user.get('car_brand'))
-                        _kv('profile_car_model', user.get('car_model'))
-                        _kv('profile_car_color', user.get('car_color'))
-                        _kv('profile_car_number', user.get('car_number'))
-                        # фото
-                        imgs = [user.get('car_image'), user.get('techpass_image')]
-                        imgs = [x for x in imgs if x]
-                        if imgs:
-                            ui.separator()
-                            with ui.row().classes('gap-2 no-wrap'):
-                                for src in imgs:
-                                    ui.image(src).classes('w-40 h-32').style('object-fit:cover;border-radius:12px;')
-                        else:
-                            ui.label(lang_dict('profile_no_car_images', current_lang)).classes('text-body2 text-grey')
+                    async def _edit_brand(_: Any | None = None) -> None:
+                        await _open_vehicle_field_dialog('car_brand', 'profile_driver_vehicle_brand')
+
+                    async def _edit_model(_: Any | None = None) -> None:
+                        await _open_vehicle_field_dialog('car_model', 'profile_driver_vehicle_model')
+
+                    async def _edit_color(_: Any | None = None) -> None:
+                        await _open_vehicle_field_dialog('car_color', 'profile_driver_vehicle_color')
+
+                    async def _edit_plate(_: Any | None = None) -> None:
+                        await _open_vehicle_field_dialog('car_number', 'profile_driver_vehicle_plate', lambda v: v.upper())
+
+                    with ui.card().classes('w-full q-pa-md q-gutter-y-sm gap-2'):
+                        _kv(icon_name='directions_car', caption_key='profile_driver_vehicle_brand', value=user.get('car_brand'), label_key='profile_driver_vehicle_edit', on_click=_edit_brand)
+                        _kv(icon_name='directions_car', caption_key='profile_driver_vehicle_model', value=user.get('car_model'), label_key='profile_driver_vehicle_edit', on_click=_edit_model)
+                        _kv(icon_name='palette', caption_key='profile_driver_vehicle_color', value=user.get('car_color'), label_key='profile_driver_vehicle_edit', on_click=_edit_color)
+                        _kv(icon_name='pin', caption_key='profile_driver_vehicle_plate', value=user.get('car_number'), label_key='profile_driver_vehicle_edit', on_click=_edit_plate)
+
+                    docs_spec: list[tuple[str, str, str]] = [
+                        ('car_image', 'profile_vehicle_car_photo', 'car'),
+                        ('techpass_image', 'profile_vehicle_techpass', 'techpass'),
+                        ('driver_license', 'profile_vehicle_license', 'driver_license'),
+                    ]
+
+                    allowed_ext: set[str] = {'.jpg', '.jpeg', '.png', '.webp', '.pdf'}
+
+                    async def _handle_upload_event(
+                        *,
+                        target_field: str,
+                        kind_alias: str,
+                        event_obj: Any,
+                        progress_bar: ui.linear_progress | None,
+                        uploader_ctrl: ui.upload,
+                    ) -> None:
+                        # Обработчик загрузки: сохраняем файл и обновляем данные в разделе авто.
+                        try:
+                            uploader_ctrl.disable()
+                            file_name = (
+                                getattr(event_obj, 'name', None)
+                                or getattr(getattr(event_obj, 'file', None), 'name', None)
+                                or ''
+                            )
+                            ext = Path(file_name).suffix.lower()
+                            if ext and ext not in allowed_ext:
+                                ui.notify(lang_dict('profile_vehicle_image_update_error', current_lang), type='negative')
+                                await _log(
+                                    f"[profile_menu][car][upload] запрещённое расширение: {ext}",
+                                    type_msg='warning',
+                                )
+                                return
+
+                            if progress_bar is not None:
+                                progress_bar.visible = True
+                                progress_bar.value = 0.0
+
+                            saved_path = await _save_upload(
+                                uid,
+                                event_obj,
+                                kind_alias,
+                                progress_bar,
+                                lang=current_lang,
+                            )
+                            await _save(
+                                updates={target_field: saved_path},
+                                section='car_data',
+                                ok_key='profile_vehicle_image_updated',
+                                err_key='profile_vehicle_image_update_error',
+                            )
+                        except Exception as upload_error:
+                            await _log(
+                                f"[profile_menu][car][upload][ОШИБКА] {upload_error!r}",
+                                type_msg='error',
+                            )
+                            ui.notify(
+                                lang_dict('profile_vehicle_image_update_error', current_lang),
+                                type='negative',
+                            )
+                            raise
+                        finally:
+                            if progress_bar is not None:
+                                try:
+                                    progress_bar.value = 0.0
+                                    progress_bar.visible = False
+                                except Exception:
+                                    pass
+                            try:
+                                uploader_ctrl.enable()
+                            except Exception:
+                                pass
+
+                    with ui.card().classes('w-full q-pa-md gap-3'):
+                        ui.label(lang_dict('profile_vehicle_docs_title', current_lang)).classes('text-subtitle1')
+                        ui.separator()
+
+                        for field, title_key, kind in docs_spec:
+                            current_path = user.get(field)
+
+                            with ui.column().classes('w-full gap-2 q-mb-md'):
+                                ui.label(lang_dict(title_key, current_lang)).classes('text-body1')
+                                if current_path:
+                                    with ui.row().classes('gap-2 items-center wrap'):
+                                        ui.icon('insert_drive_file').props('size=20px color=grey-6')
+                                        ui.label(os.path.basename(current_path)).classes('text-caption text-grey')
+
+                                        async def _view(_: Any | None = None, f=field, t=title_key) -> None:
+                                            await _show_image_dialog(f, t)
+
+                                        async def _remove(_: Any | None = None, f=field, t=title_key) -> None:
+                                            await _confirm_remove_image(f, t)
+                                    with ui.row().classes('gap-2 items-center wrap'):
+                                        ui.button(
+                                            lang_dict('profile_vehicle_image_remove', current_lang),
+                                            on_click=_remove,
+                                        ).props('color=negative flat')
+                                        ui.button(
+                                            lang_dict('profile_vehicle_image_view', current_lang),
+                                            on_click=_view,
+                                        ).props('color=primary flat')
+                                else:
+                                    ui.label(lang_dict('profile_vehicle_image_missing', current_lang)).classes('text-caption text-grey')
+
+                                if (not current_path) and uid:
+                                    # Кастомная кнопка загрузки на базе NiceGUI upload с прогрессом.
+                                    upload_row = ui.row().classes('items-center gap-2 wrap')
+                                    with upload_row:
+                                        uploader = ui.upload(
+                                            label=lang_dict('profile_vehicle_file_select', current_lang),
+                                        ).props('accept=".jpg,.jpeg,.png,.webp,.pdf" auto-upload max-files=1 color=primary flat no-caps')
+
+                                    progress_bar = ui.linear_progress(value=0).classes('w-full')
+                                    progress_bar.visible = False
+
+                                    async def _on_upload(event: Any, f=field, k=kind, u=uploader, pb=progress_bar) -> None:
+                                        await _handle_upload_event(
+                                            target_field=f,
+                                            kind_alias=k,
+                                            event_obj=event,
+                                            progress_bar=pb,
+                                            uploader_ctrl=u,
+                                        )
+
+                                    uploader.on_upload(_on_upload)
+                                elif not current_path:
+                                    await _log(
+                                        f"[profile_menu][car][upload_skip] uid отсутствует для field={field}",
+                                        type_msg='warning',
+                                    )
             except Exception as e:
                 await _log(f'[profile_menu][car][ОШИБКА] {e!r}', type_msg='error')
                 raise
 
         async def _render_balance(content: ui.element) -> None:
             try:
+                async def _open_balance_dialog(_: Any | None = None) -> None:
+                    async def _updates_factory(value: str, _secondary: str | None) -> dict[str, Any]:
+                        cleaned_raw = (value or '').strip().replace(' ', '').replace(',', '.')
+                        if not cleaned_raw:
+                            raise ValueError('profile_balance_invalid_amount')
+                        try:
+                            amount_decimal = Decimal(cleaned_raw)
+                        except InvalidOperation as invalid_amount:
+                            await _log(f"[profile_menu][balance][parse][ОШИБКА] {invalid_amount!r}", type_msg='warning')
+                            raise ValueError('profile_balance_invalid_amount')
+                        return {'balance': float(amount_decimal)}
+
+                    await _open_input_dialog(
+                        initial_value=str(user.get('balance') or 0),
+                        label_key='profile_balance_amount_label',
+                        action_key='profile_balance_save',
+                        updates_factory=_updates_factory,
+                        section='balance',
+                        ok_key='profile_balance_updated',
+                        err_key='profile_balance_update_error',
+                    )
+
                 with content:
-                    with ui.card().classes('w-full q-pa-md gap-2'):
-                        bal = user.get('balance')
-                        ui.label(lang_dict('profile_balance_current', current_lang, value=str(bal or 0))).classes('text-h6')
-                        txs = user.get('transactions') or []
-                        if not txs:
-                            ui.label(lang_dict('profile_no_transactions', current_lang)).classes('text-body2 text-grey')
-                        else:
-                            with ui.column().classes('w-full q-gutter-y-sm'):
-                                for t in txs[:10]:
-                                    # ожидаем t: {"amount": 10.5, "title": "...", "created_at": "..."}
-                                    title = str((t or {}).get('title') or lang_dict('profile_txn', current_lang))
-                                    amount = str((t or {}).get('amount') or '0')
-                                    dt = str((t or {}).get('created_at') or '')
-                                    ui.label(f'{title} — {amount} — {dt}').classes('text-body2')
+                    with ui.card().classes('w-full q-pa-md gap-3'):
+                        amount = user.get('balance') or 0
+                        ui.label(lang_dict('profile_balance_value', current_lang, amount=str(amount))).classes('text-h6')
+                        ui.button(
+                            lang_dict('profile_balance_edit', current_lang),
+                            on_click=_open_balance_dialog,
+                        ).props('color=primary unelevated')
             except Exception as e:
                 await _log(f'[profile_menu][balance][ОШИБКА] {e!r}', type_msg='error')
                 raise
@@ -930,7 +1202,7 @@ if (uid) {{
                     section, "profile_personal_title"
                 )
                 with root:
-                    with ui.column().classes("w-full gap-4 q-pa-lg"):
+                    with ui.column().classes("w-full q-mt-md"):
                         with ui.row().classes("w-full items-center").style('position: relative;'):
                             ui.button(
                                 icon="arrow_back",
@@ -939,7 +1211,7 @@ if (uid) {{
                             ui.label(
                                 lang_dict(title_key, current_lang),
                             ).classes("text-h6 text-center").style('position:absolute; left:50%; transform:translateX(-50%);')
-                    content = ui.column().classes('w-full q-gutter-y-md')
+                    content = ui.column().classes('w-full q-gutter-y-sm').style('max-height:100%;')
 
                     renderer = SECTION_RENDERERS.get(section)
                     if renderer is not None:
@@ -1039,9 +1311,9 @@ if (uid) {{
                             additional_input.props(f'placeholder="{missing_placeholder}"')
 
                 # Обрабатываем переход по Enter между полями
-                bind_enter_action(input_main, additional_input if additional else None, close=not additional)
+                await bind_enter_action(input_main, additional_input if additional else None, close=not additional)
                 if additional_input is not None:
-                    bind_enter_action(additional_input, close=True)
+                    await bind_enter_action(additional_input, close=True)
 
                 return input_main, additional_input
             except Exception as body_error:
@@ -1096,12 +1368,11 @@ if (uid) {{
                         # безопасные зоны, без var(--kb)
                         "padding: calc(16px + env(safe-area-inset-top,0px)) 16px "
                         "calc(16px + env(safe-area-inset-bottom,0px)) 16px;"
-                        "overflow:visible;"
                     )
 
                     with center:
                         wrapper = ui.element("div").style(
-                            "position:relative; display:inline-block; overflow:visible; width:min(560px,92vw);"
+                            "position:relative; display:inline-block; width:min(560px,92vw);"
                             # если клавиатура огромная — ограничим высоту так, чтобы карточка была видимой
                             "max-height: calc(100% - 32px);"
                         )
@@ -1115,10 +1386,7 @@ if (uid) {{
                             .classes("z-top")\
                             .style("position:absolute; right:12px; bottom: calc(100% + 8px); pointer-events:auto;")
 
-                            with ui.card().classes("w-full q-pa-md gap-3").style(
-                                # когда клавиатура есть, внутренности можно прокручивать
-                                "max-height: inherit; overflow:auto;"
-                            ):
+                            with ui.card().classes("w-full q-pa-md gap-3").style('max-height:100%;'):
                                 body_slot = ui.column().classes("w-full gap-3")
                                 await body_renderer(body_slot)
                                 with ui.row().classes("w-full justify-end gap-2"):
@@ -1475,14 +1743,14 @@ if (uid) {{
                 without_chevron = {"delete_forever", "support_agent", "swap_horiz"}
                 with ui.column().classes("w-full"):
                     with ui.row().classes(
-                        "w-full items-center no-wrap q-px-none q-py-none"
+                        "w-full items-center wrap q-px-none q-py-none"
                     ):
                         with ui.row().classes("items-center gap-1"):
                             ui.icon(icon_name).props("size=22px")
                             ui.label(lang_dict(text_key, user_lang)).classes(
                                 "text-body1"
                             )
-                        ui.space()
+                        ui.element("div").classes("flex-1")
                         if icon_name not in without_chevron:
                             ui.icon("chevron_right").props("size=24px")
 
@@ -1497,111 +1765,115 @@ if (uid) {{
             )
 
             with root:
-                header_card = ui.card().classes("w-full  q-pa-none gap-4")
-                with header_card:
-                    with ui.row().classes("items-center gap-4 no-wrap"):
-                        avatar = ui.avatar().props("size=84").classes(
-                            "profile-avatar"
-                        )
-                        if avatar_url:
-                            avatar.props("color=transparent text-color=transparent")
-                            avatar.style(
-                                "background-color: transparent; border: none; padding: 0; box-shadow: none;"
+                # контейнер даёт боковые отступы, карточка по полной ширине
+                with ui.column().classes('full-width window-height flex flex-col'):
+                    header_card = ui.card().classes('w-full q-mt-md q-mb-sm gap-4')
+                    with header_card:
+                        with ui.row().classes("items-center gap-4 wrap"):
+                            avatar = ui.avatar().props("size=84").classes(
+                                "profile-avatar"
                             )
-                            with avatar:
-                                ui.image(avatar_url).classes(
-                                    "w-full h-full"
-                                ).style(
-                                    "object-fit: cover; border-radius: inherit;"
+                            if avatar_url:
+                                avatar.props("color=transparent text-color=transparent")
+                                avatar.style(
+                                    "background-color: transparent; border: none; padding: 0; box-shadow: none;"
                                 )
-                        else:
-                            avatar.props("icon=person color=primary text-color=white")
-
-                        with ui.column().classes("gap-1"):
-                            ui.label(
-                                user.get("first_name")
-                                or lang_dict("unknown_user", current_lang)
-                            ).props("text-color=primary").classes("text-h6")
-                            with ui.row().classes(
-                                "items-center gap-2 text-body1 text-primary"
-                            ):
-                                ui.icon("star").props("color=primary size=22")
-                                ui.label(
-                                    lang_dict(
-                                        rating_key,
-                                        current_lang,
-                                        value=rating_value,
+                                with avatar:
+                                    ui.image(avatar_url).classes(
+                                        "w-full h-full"
+                                    ).style(
+                                        "object-fit: cover; border-radius: inherit;"
                                     )
+                            else:
+                                avatar.props("icon=person color=primary text-color=white")
+
+                            with ui.column().classes("gap-1"):
+                                ui.label(
+                                    user.get("first_name")
+                                    or lang_dict("unknown_user", current_lang)
+                                ).props("text-color=primary").classes("text-h6")
+                                with ui.row().classes("items-center gap-2 text-body1 text-primary"):
+                                    ui.icon("star").props("color=primary size=22")
+                                    ui.label(lang_dict(rating_key,current_lang,value=rating_value))
+                                if current_role == "driver":
+                                    verify_dr = await verify_driver(uid)
+                                    with ui.row().classes("items-center gap-2 text-body1"):
+                                        if verify_dr:
+                                            ui.icon("verified_user").props("color=green size=22")
+                                            ui.label(lang_dict("verified_driver", current_lang)).classes("text-green")
+                                        else:
+                                            ui.icon("warning").props("color=yellow size=22")
+                                            ui.label(lang_dict("unverified_driver", current_lang)).classes("text-yellow")
+                                    
+
+                    with ui.card().classes("w-full q-mb-sm gap-4"):
+                        with ui.tab_panel("personal_data").classes("w-full") as personal_panel:
+                            await _panel_header(
+                                "person",
+                                "profile_personal_title",
+                                current_lang,
+                            )
+                        _attach_panel_click(personal_panel, "personal_data")
+
+                        if current_role == "driver":
+                            with ui.tab_panel("car_data").classes("w-full") as car_panel:
+                                await _panel_header(
+                                    "directions_car",
+                                    "profile_driver_vehicle_title",
+                                    current_lang,
                                 )
+                            _attach_panel_click(car_panel, "car_data")
 
-                with ui.card().classes("w-full gap-0 q-px-none q-py-none q-my-none"):
-                    with ui.tab_panel("personal_data").classes("w-full") as personal_panel:
-                        await _panel_header(
-                            "person",
-                            "profile_personal_title",
-                            current_lang,
-                        )
-                    _attach_panel_click(personal_panel, "personal_data")
+                            with ui.tab_panel("balance").classes("w-full") as balance_panel:
+                                await _panel_header(
+                                    "account_balance_wallet",
+                                    "profile_balance_title",
+                                    current_lang,
+                                )
+                            _attach_panel_click(balance_panel, "balance")
 
-                    if current_role == "driver":
-                        with ui.tab_panel("car_data").classes("w-full") as car_panel:
+                        with ui.tab_panel("settings").classes("w-full") as settings_panel:
                             await _panel_header(
-                                "directions_car",
-                                "profile_driver_vehicle_title",
+                                "settings",
+                                "profile_settings_title",
                                 current_lang,
                             )
-                        _attach_panel_click(car_panel, "car_data")
+                        _attach_panel_click(settings_panel, "settings")
 
-                        with ui.tab_panel("balance").classes("w-full") as balance_panel:
+                    registration_dialog = ui.dialog().props("persistent maximized")
+                    with registration_dialog:
+                        reg_container = ui.column().classes(
+                            "w-full h-full gap-4 q-pa-md overflow-auto"
+                        )
+
+                    with ui.card().classes("w-full q-mb-md gap-4"):
+                        with ui.tab_panel("role_switch").classes(
+                            "w-full q-pa-none"
+                        ) as role_panel:
                             await _panel_header(
-                                "account_balance_wallet",
-                                "profile_balance_title",
+                                "swap_horiz",
+                                role_switch_key,
                                 current_lang,
                             )
-                        _attach_panel_click(balance_panel, "balance")
+                        _attach_panel_click(role_panel, "role_switch")
 
-                    with ui.tab_panel("settings").classes("w-full") as settings_panel:
-                        await _panel_header(
-                            "settings",
-                            "profile_settings_title",
-                            current_lang,
-                        )
-                    _attach_panel_click(settings_panel, "settings")
+                        with ui.tab_panel("support").classes(
+                            "w-full q-pa-none"
+                        ) as support_panel:
+                            await _panel_header(
+                                "support_agent",
+                                "profile_support_title",
+                                current_lang,
+                            )
+                        _attach_panel_click(support_panel, "support")
 
-                registration_dialog = ui.dialog().props("persistent maximized")
-                with registration_dialog:
-                    reg_container = ui.column().classes(
-                        "w-full h-full gap-4 q-pa-md overflow-auto"
-                    )
-
-                with ui.card().classes("w-full gap-0 q-px-none q-py-none q-my-none"):
-                    with ui.tab_panel("role_switch").classes(
-                        "w-full q-pa-none"
-                    ) as role_panel:
-                        await _panel_header(
-                            "swap_horiz",
-                            role_switch_key,
-                            current_lang,
-                        )
-                    _attach_panel_click(role_panel, "role_switch")
-
-                    with ui.tab_panel("support").classes(
-                        "w-full q-pa-none"
-                    ) as support_panel:
-                        await _panel_header(
-                            "support_agent",
-                            "profile_support_title",
-                            current_lang,
-                        )
-                    _attach_panel_click(support_panel, "support")
-
-                    with ui.tab_panel("delete").classes("w-full q-pa-none") as delete_panel:
-                        await _panel_header(
-                            "delete_forever",
-                            "profile_delete_title",
-                            current_lang,
-                        )
-                    _attach_panel_click(delete_panel, "delete")
+                        with ui.tab_panel("delete").classes("w-full q-pa-none") as delete_panel:
+                            await _panel_header(
+                                "delete_forever",
+                                "profile_delete_title",
+                                current_lang,
+                            )
+                        _attach_panel_click(delete_panel, "delete")
 
         await _render(current_lang)
 

@@ -3,10 +3,9 @@ from __future__ import annotations
 from nicegui import ui
 from contextlib import nullcontext
 import asyncio
-from db.db_utils import user_exists, update_table, insert_into_table, get_user_data 
+from db.db_utils import user_exists, update_table, insert_into_table
 from config.config_from_db import load_cities, load_country_choices
 from web.web_utilits import _save_upload, bind_enter_action
-from web.web_notify import notify_user
 from config.config_utils import lang_dict
 from keyboards.inline_kb_verification import verification_inline_kb
 from log.log import log_info, send_info_msg
@@ -315,7 +314,13 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
 
                     async def on_license_upload(e):
                         try:
-                            model['driver_license'] = await _save_upload(uid, e, 'driver_license')
+                            model['driver_license'] = await _save_upload(
+                                uid,
+                                e,
+                                'driver_license',
+                                None,
+                                lang=user_lang,
+                            )
                             license_ok['img'] = True
                             ui.notify(lang_dict('upload_driver_license_success', user_lang))
                             next_license.enable()
@@ -376,7 +381,13 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
 
                         async def on_car_upload(e):
                             try:
-                                model['car_image'] = await _save_upload(uid, e, 'car')
+                                model['car_image'] = await _save_upload(
+                                    uid,
+                                    e,
+                                    'car',
+                                    None,
+                                    lang=user_lang,
+                                )
                                 car_ok['img'] = True
                                 ui.notify(lang_dict('upload_car_success', user_lang))
                                 _sync_car()
@@ -417,7 +428,13 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
 
                     async def on_tp_upload(e):
                         try:
-                            model['techpass_image'] = await _save_upload(uid, e, 'techpass')
+                            model['techpass_image'] = await _save_upload(
+                                uid,
+                                e,
+                                'techpass',
+                                None,
+                                lang=user_lang,
+                            )
                             tp_ok['img'] = True
                             ui.notify(lang_dict('upload_techpass_success', user_lang))
                             _sync_docs()                      # <<< ключевая строка
@@ -485,13 +502,13 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                 _reveal_and_next(None)
                 st.set_value('city')
 
-            def _on_step_change(e):
+            async def _on_step_change(e):
                 val = getattr(e, 'value', None)
                 if val == 'car':
-                    bind_enter_action(car_brand, dst=car_model)
-                    bind_enter_action(car_model, dst=car_color)
-                    bind_enter_action(car_color, close=True)
+                    await bind_enter_action(car_brand, dst=car_model)
+                    await bind_enter_action(car_model, dst=car_color)
+                    await bind_enter_action(car_color, close=True)
                 elif val == 'docs':
-                    bind_enter_action(plate, close=True)
+                    await bind_enter_action(plate, close=True)
 
             st.on_value_change(_on_step_change)

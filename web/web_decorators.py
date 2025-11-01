@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import functools
-import asyncio
 from nicegui import ui, app 
 from fastapi import Request
-from functools import wraps
 from db.db_utils import update_table, get_user_theme, user_exists, insert_into_table, get_user_data 
 from config.config_utils import lang_dict
 from config.config import SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES
@@ -98,6 +96,9 @@ def _ensure_theme_assets_once() -> None:
     width: 100%; 
     max-width: 100%; 
     overflow-x: hidden !important;
+  }
+  .q-tab-panel {
+    padding: 0 !important;
   }
 </style>
 ''')
