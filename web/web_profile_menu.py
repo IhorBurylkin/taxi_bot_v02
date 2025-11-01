@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import asyncio
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -19,7 +20,7 @@ from web.web_utilits import (
 )
 
 from log.log import log_info
-from config.config import SUPPORTED_LANGUAGE_NAMES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES
+from config.config import SUPPORTED_LANGUAGE_NAMES, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES, GMAPS_API_KEY
 from config.config_utils import lang_dict
 from db.db_utils import delete_user, update_table
 
@@ -1450,6 +1451,15 @@ async def profile_menu(
                             additional=additional,
                             value_main=initial_value,
                         )
+                        if label_key == 'profile_address_value_edit':
+                            try:
+                                client = getattr(input_main, 'client', None)
+                                # Небольшая задержка, чтобы диалог гарантированно смонтировался
+                                ui.timer(0.05, lambda: asyncio.create_task(
+                                        _enable_address_autocomplete(input_main, country_hint=user.get('country'), client=client,)
+                                    ), once=True)
+                            except Exception as hook_err:
+                                await _log(f"[profile_menu][address][autocomplete][ОШИБКА] {hook_err!r}", type_msg="warning")
                     except Exception as body_error:
                         await _log(
                             f"[profile_menu][field_dialog][body][ОШИБКА] {body_error!r}",
@@ -1691,6 +1701,109 @@ async def profile_menu(
                 raise
 
         tabs.on_value_change(_handle_tab_change)
+
+        async def _ensure_pac_zindex_css(client) -> None:
+            try:
+                css = ".pac-container{z-index:2147483647!important}.pac-container:empty{display:none!important}"
+                js = f"(function(){{if(window.__pac_css)return;var s=document.createElement('style');s.textContent={json.dumps(css)};document.head.appendChild(s);window.__pac_css=true;}})();"
+                with client:
+                    await ui.run_javascript(js)  # быстрый, в контексте клиента
+                await _log("[addr_autocomplete] pac z-index CSS injected", type_msg="info")
+            except Exception as e:
+                await _log(f"[addr_autocomplete][css][ОШИБКА] {e!r}", type_msg="warning")
+
+        # ── нормализация страны к ISO-alpha-2 ──
+        async def _country_alpha2(value: str | None) -> str | None:
+            try:
+                if not value:
+                    return None
+                v = value.strip().lower()
+                # быстрый путь: уже alpha-2
+                if len(v) == 2 and v.isalpha():
+                    return v.upper()
+                # мини-маппинг частых значений
+                m = {
+                    'germany': 'DE', 'deu': 'DE', 'германия': 'DE',
+                    'russia': 'RU', 'россия': 'RU', 'rus': 'RU',
+                    'ukraine': 'UA', 'украина': 'UA', 'ukr': 'UA',
+                    'poland': 'PL', 'польша': 'PL', 'pol': 'PL',
+                }
+                return m.get(v)
+            except Exception as e:
+                await _log(f"[country_norm][ОШИБКА] {e!r}", type_msg="warning")
+                return None
+
+        # ── Автодополнение адреса через Google Places (подвязывается к ui.input) ──
+        
+        async def _enable_address_autocomplete(
+            input_el: ui.input,
+            *,
+            country_hint: str | None = None,
+            client: Any | None = None,
+        ) -> None:
+            """Вешает Google Places Autocomplete на поле ввода адреса. Мягко уходит, если нет ключа."""
+            try:
+                client = client or getattr(input_el, 'client', None)
+                if client is None:
+                    await _log("[addr_autocomplete] нет client у input_el", type_msg="warning")
+                    return
+
+                api_key = os.getenv('GMAPS_API_KEY', '') or GMAPS_API_KEY
+                if not api_key:
+                    await _log("[addr_autocomplete] пропуск: GMAPS_API_KEY отсутствует", type_msg="warning")
+                    return
+
+                el_id = input_el.id
+                country_alpha2 = await _country_alpha2(country_hint)  # 'DE' из 'Germany'
+                lang = (current_lang or "en").lower()
+
+                await _ensure_pac_zindex_css(client)
+
+                # ВАЖНО: никакого async/await внутри — планируем работу и выходим сразу,
+                # чтобы ui.run_javascript не упирался в сетевые задержки и не ловил TimeoutError.
+                js = f"""(function(){{
+                    var apiKey={json.dumps(api_key)},lang={json.dumps(lang)},elId={json.dumps(el_id)},country={json.dumps(country_alpha2) if country_alpha2 else "null"};
+                    function loadScriptOnce(){{
+                        if (typeof google!=='undefined'&&google.maps&&google.maps.places) return;
+                        if (window._gmaps_script_loading) return;
+                        window._gmaps_script_loading = true;
+                        var s=document.createElement('script');
+                        s.src="https://maps.googleapis.com/maps/api/js?key="+apiKey+"&libraries=places&language="+lang;
+                        s.async=true; s.onerror=function(){{console.warn('GMAPS load failed');}};
+                        document.head.appendChild(s);
+                    }}
+                    function ensureNative(cb){{
+                        var host=document.getElementById(elId);
+                        if(!host) return setTimeout(function(){{ensureNative(cb)}},100);
+                        var native=host.querySelector('input')||host; cb(native);
+                    }}
+                    function attach(native){{
+                        if(!native||native._has_places) return;
+                        (function tryInit(){{
+                        if(!(window.google&&google.maps&&google.maps.places)) return setTimeout(tryInit,100);
+                        native._has_places=true;
+                        var opts={{fields:['formatted_address','geometry','name','place_id'],types:['address']}};
+                        if(country) opts.componentRestrictions={{country:country}};
+                        var ac=new google.maps.places.Autocomplete(native,opts);
+                        ac.addListener('place_changed',function(){{
+                            var p=ac.getPlace(); var v=(p&&(p.formatted_address||p.name))||native.value||'';
+                            native.value=v;
+                            native.dispatchEvent(new Event('input',{{bubbles:true}}));
+                            native.dispatchEvent(new Event('change',{{bubbles:true}}));
+                        }});
+                        }})();
+                    }}
+                    loadScriptOnce(); ensureNative(attach);
+                    }})();"""
+
+                with client:
+                    # Вызов завершается мгновенно (скрипт сам всё сделает позже)
+                    await ui.run_javascript(js, timeout=1.0)
+                await _log(f"[addr_autocomplete] инициализировано, country_iso -> {country_alpha2}", type_msg="info")
+
+            except Exception as e:
+                await _log(f"[addr_autocomplete][ОШИБКА] {e!r}", type_msg="error")
+                # не пробрасываем: UX не должен падать из-за автодополнения
 
         # === Центральная функция повторной отрисовки профиля ===
         async def _render(lang: str) -> None:

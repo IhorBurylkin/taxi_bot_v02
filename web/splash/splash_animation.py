@@ -24,6 +24,7 @@ from functools import wraps
 from pathlib import Path
 from urllib.parse import quote as url_quote
 from nicegui import ui
+from web.web_utilits import _safe_js
 
 
 def _get_default_svg() -> str:
@@ -198,7 +199,7 @@ async def show_splash_immediate(
     ''')
     
     # УПРОЩЕННЫЙ JavaScript - показываем СРАЗУ, без ожидания theme:ready
-    await ui.run_javascript(f'''
+    await _safe_js(f'''
         (async function() {{
             console.log('[SPLASH] Немедленная инициализация splash screen ID: {overlay_id}');
             
@@ -226,14 +227,14 @@ async def show_splash_immediate(
             overlay.style.opacity = '1';
             console.log('[SPLASH] Splash отображён, opacity=1');
         }})();
-    ''')
+    ''', timeout=3.0)
     
     async def hide():
         """Скрывает splash screen"""
         try:
             print(f"[SPLASH] Начинаем скрывать splash {overlay_id}")
             
-            await ui.run_javascript(f'''
+            await _safe_js(f'''
                 console.log('[SPLASH] Скрываем overlay...');
                 const overlay = document.getElementById('{overlay_id}');
                 if (overlay) {{
@@ -243,12 +244,12 @@ async def show_splash_immediate(
                 }} else {{
                     console.error('[SPLASH] Overlay не найден при скрытии');
                 }}
-            ''')
+            ''', timeout=3.0)
             
             # Ждём завершения анимации
             await asyncio.sleep(fade_out_ms / 1000 + 0.1)
             
-            await ui.run_javascript(f'''
+            await _safe_js(f'''
                 console.log('[SPLASH] Удаляем overlay и возвращаем скролл');
                 document.body.style.overflow = '';
                 const overlay = document.getElementById('{overlay_id}');
@@ -256,7 +257,7 @@ async def show_splash_immediate(
                     overlay.remove();
                     console.log('[SPLASH] Overlay удалён');
                 }}
-            ''')
+            ''', timeout=3.0)
             
             print(f"[SPLASH] Splash {overlay_id} успешно скрыт и удалён")
             
