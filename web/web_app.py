@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+from typing import Any
 from starlette.middleware.sessions import SessionMiddleware
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, ValidationError
 from nicegui import ui, app, storage
 from web.web_decorators import require_twa, with_theme_toggle
 from web.web_start_reg_form import start_reg_form_ui
@@ -27,6 +30,26 @@ _last_nav_ts: float = 0.0
 # 1) Базовый FastAPI
 fastapi_app = FastAPI()
 
+
+class ClientLogPayload(BaseModel):
+    """Модель тела запроса, отправляемого фронтендом."""
+
+    level: str | None = Field(default=None)
+    message: str | None = Field(default=None)
+    stack: str | None = Field(default=None)
+    source: str | None = Field(default=None)
+    line: int | None = Field(default=None)
+    column: int | None = Field(default=None)
+    url: str | None = Field(default=None)
+    user_agent: str | None = Field(default=None, alias="userAgent")
+    timestamp: float | None = Field(default=None)
+    client_id: str | int | None = Field(default=None, alias="clientId")
+    user_id: int | str | None = Field(default=None, alias="userId")
+    extra: dict[str, Any] | None = Field(default=None)
+
+    class Config:
+        populate_by_name = True
+
 # 2) Middleware
 fastapi_app.add_middleware(storage.RequestTrackingMiddleware)
 fastapi_app.add_middleware(
@@ -39,6 +62,120 @@ ui.run_with(
     fastapi_app, 
     storage_secret=os.getenv('STORAGE_SECRET', 'change-me-please')
 )
+
+
+@app.post('/api/client_log')
+async def client_log(request: Request) -> dict[str, str]:
+    """Принимаем сообщения об ошибках с фронтенда и зеркалим их в лог."""
+    try:
+        # ------------------------------------------------------------------
+        # Читаем исходное тело запроса и пытаемся преобразовать к словарю.
+        # ------------------------------------------------------------------
+        raw_body: bytes = b""
+        try:
+            raw_body = await request.body()
+        except Exception as read_error:
+            await log_info(
+                "[client_log] не удалось прочитать тело запроса",
+                type_msg="warning",
+                reason=str(read_error),
+            )
+
+        payload_source: dict[str, Any]
+        if raw_body:
+            try:
+                parsed_body = json.loads(raw_body)
+                if isinstance(parsed_body, dict):
+                    payload_source = parsed_body
+                else:
+                    await log_info(
+                        "[client_log] тело запроса имеет неподдерживаемый формат",
+                        type_msg="warning",
+                        incoming_value=parsed_body,
+                    )
+                    payload_source = {}
+            except json.JSONDecodeError as decode_error:
+                raw_fragment = raw_body.decode('utf-8', errors='replace')[:2000]
+                await log_info(
+                    "[client_log] не удалось разобрать JSON из тела запроса",
+                    type_msg="warning",
+                    reason=str(decode_error),
+                    raw_fragment=raw_fragment,
+                )
+                payload_source = {}
+        else:
+            payload_source = {}
+
+        payload_model: ClientLogPayload | None = None
+        if payload_source:
+            try:
+                payload_model = ClientLogPayload.model_validate(payload_source)
+            except ValidationError as validation_error:
+                errors_list = validation_error.errors()
+                truncated_payload = json.dumps(payload_source, ensure_ascii=False)[:1000]
+                await log_info(
+                    "[client_log] данные не прошли валидацию модели; см. ошибки и сокращённый payload",
+                    type_msg="warning",
+                    errors=errors_list,
+                    raw_payload=truncated_payload,
+                )
+        if payload_model is None:
+            payload_model = ClientLogPayload()
+
+        # ------------------------------------------------------------------
+        # Достаём значения из модели либо исходного словаря.
+        # ------------------------------------------------------------------
+        client_host: str | None = request.client.host if request.client else None
+
+        def _value(attr: str, alias: str | None = None) -> Any:
+            if getattr(payload_model, attr) is not None:
+                return getattr(payload_model, attr)
+            if alias is not None and alias in payload_source:
+                return payload_source.get(alias)
+            return payload_source.get(attr)
+
+        level_raw: str = str(_value('level')).lower() if _value('level') else 'error'
+        if 'error' in level_raw:
+            type_msg = 'error'
+        elif 'warn' in level_raw:
+            type_msg = 'warning'
+        else:
+            type_msg = 'info'
+
+        line_value = _value('line')
+        column_value = _value('column')
+        user_id_value = _value('user_id', 'userId')
+        client_id_value = _value('client_id', 'clientId')
+
+        details: list[str] = [
+            f"уровень={level_raw}",
+            f"сообщение={_value('message') or '—'}",
+            f"источник={_value('source') or 'не указан'}",
+            f"позиция={line_value}:{column_value}" if line_value is not None else 'позиция=нет данных',
+            f"url={_value('url') or 'не указано'}",
+            f"ip={client_host or 'не определён'}",
+        ]
+        if user_id_value is not None:
+            details.append(f"user_id={user_id_value}")
+        if client_id_value:
+            details.append(f"client_id={client_id_value}")
+
+        await log_info(
+            f"[client_log] {'; '.join(details)}",
+            type_msg=type_msg,
+            stack=_value('stack'),
+            user_agent=_value('user_agent', 'userAgent'),
+            timestamp=_value('timestamp'),
+            extra_payload=_value('extra'),
+        )
+
+        return {"status": "ok"}
+    except Exception as err:
+        await log_info(
+            f"[client_log][ОШИБКА] {err!r}",
+            type_msg="error",
+        )
+        raise HTTPException(status_code=500, detail="Не удалось сохранить клиентский лог")
 
 
 # ============================================================================
@@ -279,6 +416,87 @@ async def main_app():
                 type_msg="warning",
             )
 
+        # Регистрируем перехват ошибок фронтенда и передачу на сервер
+        client_log_user_json = json.dumps(uid)
+        try:
+            await ui.run_javascript(
+                f"""
+                (function(){{
+                  if (window.__clientLogBound) {{ return; }}
+                  window.__clientLogBound = true;
+                  const endpoint = '/api/client_log';
+                  const userId = {client_log_user_json};
+                
+                  const sendLog = (payload) => {{
+                    try {{
+                      const base = {{
+                        url: window.location.href,
+                        userAgent: navigator.userAgent,
+                        timestamp: Date.now(),
+                        userId: userId,
+                        clientId: window.Telegram?.WebApp?.initDataUnsafe?.user?.id ?? null,
+                      }};
+                      const bodyObj = Object.assign(base, payload || {{}});
+                      const body = JSON.stringify(bodyObj);
+                      if (navigator.sendBeacon) {{
+                        const blob = new Blob([body], {{ type: 'application/json' }});
+                        navigator.sendBeacon(endpoint, blob);
+                        return true;
+                      }}
+                      fetch(endpoint, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body,
+                        keepalive: true,
+                      }}).catch(() => {{}});
+                      return true;
+                    }} catch (transportError) {{
+                      console.warn('client_log send failed', transportError);
+                      return false;
+                    }}
+                  }};
+                
+                  sendLog({{ level: 'info', message: 'client_log_ready' }});
+                
+                  window.addEventListener('error', (event) => {{
+                    if (!event) {{ return; }}
+                    sendLog({{
+                      level: 'error',
+                      message: event.message || null,
+                      source: event.filename || null,
+                      line: event.lineno || null,
+                      column: event.colno || null,
+                      stack: event.error?.stack || null,
+                    }});
+                  }}, true);
+                
+                  window.addEventListener('unhandledrejection', (event) => {{
+                    if (!event) {{ return; }}
+                    let message = 'Unhandled rejection';
+                    let stack = null;
+                    if (event.reason) {{
+                      if (typeof event.reason === 'string') {{
+                        message = event.reason;
+                      }} else if (event.reason && typeof event.reason === 'object') {{
+                        message = event.reason.message || message;
+                        stack = event.reason.stack || null;
+                      }}
+                    }}
+                    sendLog({{
+                      level: 'error',
+                      message,
+                      stack,
+                    }});
+                  }});
+                }})();
+                """,
+                timeout=3.0,
+            )
+        except Exception as js_error:
+            await log_info(
+                f"[page:/main_app][client_log_js][ОШИБКА] {js_error!r}",
+                type_msg="warning",
+            )
         # ====================================================================
         # Синхронизация состояния для прямых ссылок
         # ====================================================================
