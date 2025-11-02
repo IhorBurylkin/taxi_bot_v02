@@ -25,7 +25,7 @@ import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Iterable
+
 
 from config.config import (
     LOGGING_FILE_PATH,
@@ -118,6 +118,61 @@ def _rotate_file(path: str, logger: logging.Logger) -> None:
         pass
     _readd_file_handler(path, logger)
 
+
+async def _send_log_file(
+    *,
+    file_path: str,
+    logger: logging.Logger,
+    chat_id: int | str | None,
+    thread_id: int | None,
+) -> bool:
+    """Отправляет указанный лог-файл и при успехе выполняет ротацию handlers."""
+    try:
+        if not _is_nonempty_file(file_path):
+            await log_info(
+                f"server_logs: файл пуст или отсутствует → {file_path}",
+                type_msg="info",
+            )
+            return False
+
+        try:
+            response = await send_info_msg(
+                document=FSInputFile(file_path),
+                caption=_file_caption(file_path),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+            )
+        except Exception as send_error:  # noqa: BLE001
+            await log_info(
+                f"server_logs: ошибка при отправке файла {file_path}: {send_error!r}",
+                type_msg="error",
+            )
+            return False
+
+        if response is None:
+            await log_info(
+                f"server_logs: бот не подтвердил доставку файла → {file_path}",
+                type_msg="warning",
+            )
+            return False
+
+        await log_info(
+            f"server_logs: файл успешно отправлен → {file_path}",
+            type_msg="info",
+        )
+        _rotate_file(file_path, logger)
+        await log_info(
+            f"server_logs: файл переинициализирован после отправки → {file_path}",
+            type_msg="info",
+        )
+        return True
+    except Exception as unexpected_error:  # noqa: BLE001
+        await log_info(
+            f"server_logs: критическая ошибка обработки файла {file_path}: {unexpected_error!r}",
+            type_msg="error",
+        )
+        return False
+
 # ---------------------------------------------------------------------------
 # Разовая отправка
 # ---------------------------------------------------------------------------
@@ -130,7 +185,7 @@ async def send_server_logs_once() -> None:
     """
     # Если запрещено — просто выходим
     if not LOGGING_SETTINGS_TO_SEND_SERVER_LOGS.get("permission", True):
-        await log_info("server_logs: sending disabled by config", type_msg="info")
+        await log_info("server_logs: отправка отключена настройками", type_msg="info")
         return
 
     chat_id = LOGGING_SETTINGS_TO_SEND_SERVER_LOGS.get("chat_id")
@@ -148,37 +203,19 @@ async def send_server_logs_once() -> None:
     root_logger = logging.getLogger()
     admin_logger = _get_admin_logger() or logging.getLogger()
 
-    # Отправка основного лога
-    if _is_nonempty_file(LOGGING_FILE_PATH):
-        resp = await send_info_msg(
-            document=FSInputFile(LOGGING_FILE_PATH),
-            caption=_file_caption(LOGGING_FILE_PATH),
-            chat_id=chat_id_cast,
-            message_thread_id=thread_id,
-        )
-        if resp:
-            await log_info(f"server_logs: LOGGING_FILE_PATH sent ok → {LOGGING_FILE_PATH}", type_msg="info")
-            _rotate_file(LOGGING_FILE_PATH, root_logger)
-        else:
-            await log_info(f"server_logs: failed to send LOGGING_FILE_PATH → {LOGGING_FILE_PATH}", type_msg="warning")
-    else:
-        await log_info(f"server_logs: file empty or missing → {LOGGING_FILE_PATH}", type_msg="warning")
+    await _send_log_file(
+        file_path=LOGGING_FILE_PATH,
+        logger=root_logger,
+        chat_id=chat_id_cast,
+        thread_id=thread_id,
+    )
 
-    # Отправка админского лога
-    if _is_nonempty_file(LOGGING_FILE_PATH_ADMINS):
-        resp = await send_info_msg(
-            document=FSInputFile(LOGGING_FILE_PATH_ADMINS),
-            caption=_file_caption(LOGGING_FILE_PATH_ADMINS),
-            chat_id=chat_id_cast,
-            message_thread_id=thread_id,
-        )
-        if resp:
-            await log_info(f"server_logs: LOGGING_FILE_PATH_ADMINS sent ok → {LOGGING_FILE_PATH_ADMINS}", type_msg="info")
-            _rotate_file(LOGGING_FILE_PATH_ADMINS, admin_logger)
-        else:
-            await log_info(f"server_logs: failed to send LOGGING_FILE_PATH_ADMINS → {LOGGING_FILE_PATH_ADMINS}", type_msg="warning")
-    else:
-        await log_info(f"server_logs: file empty or missing → {LOGGING_FILE_PATH_ADMINS}", type_msg="warning")
+    await _send_log_file(
+        file_path=LOGGING_FILE_PATH_ADMINS,
+        logger=admin_logger,
+        chat_id=chat_id_cast,
+        thread_id=thread_id,
+    )
 
 # ---------------------------------------------------------------------------
 # Бесконечный ежедневный таск
@@ -200,7 +237,7 @@ async def start_daily_server_logs_task():
             raise
         except Exception as e:
             try:
-                await log_info(f"server_logs: scheduler loop error: {e}", type_msg="error")
+                await log_info(f"server_logs: ошибка фонового цикла: {e}", type_msg="error")
             except Exception:
                 pass
             # не крутимся слишком быстро при ошибках

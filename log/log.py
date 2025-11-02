@@ -205,6 +205,7 @@ async def send_info_msg(
                         )
                     )
                 resp = await bot.send_media_group(media=media, **kwargs)
+            return resp
         elif use_docs:
             if len(docs) == 1:
                 resp = await bot.send_document(
@@ -225,6 +226,7 @@ async def send_info_msg(
                         )
                     )
                 resp = await bot.send_media_group(media=media, **kwargs)
+            return resp
         else:
             # чисто текст
             if text is None:

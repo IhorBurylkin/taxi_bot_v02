@@ -359,14 +359,6 @@ async def profile_menu(
         def _other_role(role: str) -> str:
             return "driver" if role == "passenger" else "passenger"
 
-        def _role_switch_label(role: str, lang: str) -> str:
-            return lang_dict(
-                "profile_role_switch_to_driver"
-                if role == "passenger"
-                else "profile_role_switch_to_passenger",
-                lang,
-            )
-
         def _display_value(value: str | None, lang: str) -> str:
             return value if value else lang_dict("profile_value_missing", lang)
 
