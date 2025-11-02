@@ -14,6 +14,7 @@ from web.web_start_reg_form import start_reg_form_ui
 from web.web_utilits import get_user_data_uid_lang, _safe_js
 from web.splash.splash_animation import splash_screen
 from web.web_profile_menu import profile_menu
+from web.web_main_menu import render_main_map
 
 from log.log import log_info
 from config.config_utils import lang_dict
@@ -293,12 +294,9 @@ async def main_app():
                 app.storage.client['tab_panels'] = panels
 
                 # Панель: Главная
-                with ui.tab_panel('main'):
-                    with ui.column().classes('page-center'):
-                        ui.label(
-                            lang_dict('footer_main', user_lang)
-                        ).classes('text-xl q-pa-md')
-                        # TODO: контент «Главная»
+                with ui.tab_panel('main').classes('w-full q-pa-none q-ma-none flex flex-col'):
+                    #await render_main_map(uid, user_lang, user_data)
+                    print("DEBUG: main_app - render_main_map called")
 
                 # Панель: Поездки
                 with ui.tab_panel('trips'):

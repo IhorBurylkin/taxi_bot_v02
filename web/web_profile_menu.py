@@ -24,7 +24,8 @@ from web.web_utilits import (
     verify_driver
 )
 
-from log.log import log_info
+from log.log import log_info, send_info_msg
+from keyboards.inline_kb_verification import verification_inline_kb
 from config.config import (
     SUPPORTED_LANGUAGE_NAMES,
     SUPPORTED_LANGUAGES,
@@ -57,6 +58,8 @@ ActionHandler = Callable[[Any | None], Awaitable[None]]
 BodyRenderer = Callable[[ui.element], Awaitable[None]]
 
 active_tab: str = 'profile_list'
+
+upload_successful: bool = False
 
 
 async def profile_menu(
@@ -627,11 +630,58 @@ async def profile_menu(
 
         async def _go_back_to_profile() -> None:
             """Возвращаемся на корневую карточку профиля."""
+            global upload_successful
             try:
                 await _log(
                     "[profile_menu] возврат на корневой экран",
                     type_msg="info",
                 )
+                if upload_successful:
+                    try:
+                        await update_table("users", uid, {"verified_driver": False})
+                        files_to_send = [user.get('car_image'), user.get('techpass_image'), user.get('driver_license')]
+                        if all(files_to_send):
+                            ui.notify(lang_dict('notify_verification', user_lang), type='warning', position='center')
+                            await log_info(f"[verify_driver] notify_user uid={uid}", type_msg="info", uid=uid)
+
+                            caption = (
+                                "Тип сообщения: Инфо\n"
+                                "Обновление документов водителя!\n"
+                                f"Username: {user.get('username') or '-'}\n"
+                                f"First name: {user.get('first_name') or '-'}\n"
+                                f"User ID: {uid}\n"
+                                f"Country: {user.get('country') or '-'}\n"
+                                f"Region: {user.get('region') or '-'}\n"
+                                f"City: {user.get('city') or '-'}\n"
+                                f"Phone: {user.get('phone_driver') or user.get('phone_passenger') or '-'}\n"
+                                "Car: "
+                                f"{user.get('car_brand') or '-'} "
+                                f"{user.get('car_model') or '-'} "
+                                f"{user.get('car_color') or '-'} "
+                                f"{user.get('car_number') or '-'}"
+                            )
+
+                            await send_info_msg(
+                                photo=files_to_send,
+                                type_msg_tg="new_users",
+                                caption=f"Документы водителя {uid}",
+                            )
+                            await send_info_msg(
+                                text=caption,
+                                type_msg_tg="new_users",
+                                reply_markup=verification_inline_kb(),
+                            )
+                            upload_successful = False
+                        else:
+                            await _log(
+                                "[profile_menu][car][notify] документы загружены не полностью — уведомление пропущено",
+                                type_msg="warning",
+                            )
+                    except Exception as notify_error:
+                        await _log(
+                            f"[profile_menu][car][notify][ОШИБКА] {notify_error!r}",
+                            type_msg='error',
+                        )
                 tabs.set_value("profile_list")
             except Exception as back_error:
                 await _log(
@@ -727,10 +777,11 @@ async def profile_menu(
                                     else ""
                                 )
 
-                                def _updates_factory(address_value: str, name_value: str | None) -> dict[str, Any]:
+                                # Меняем порядок ввода: сначала название, затем сам адрес
+                                def _updates_factory(name_value: str, address_value: str | None) -> dict[str, Any]:
                                     nonlocal pending_addresses
-                                    addr_clean = address_value.strip()
                                     name_clean = (name_value or "").strip()
+                                    addr_clean = (address_value or "").strip()
 
                                     if not addr_clean or not name_clean:
                                         raise ValueError('profile_address_required')
@@ -812,10 +863,10 @@ async def profile_menu(
                                         raise
 
                                 await _open_input_dialog(
-                                    initial_value=initial_address,
-                                    initial_value_2=initial_name,
-                                    label_key='profile_address_value_edit',
-                                    label_key_2='profile_address_name_edit',
+                                    initial_value=initial_name,
+                                    initial_value_2=initial_address,
+                                    label_key='profile_address_name_edit',
+                                    label_key_2='profile_address_value_edit',
                                     action_key='profile_address_save',
                                     updates_factory=_updates_factory,
                                     section='personal_data',
@@ -840,40 +891,61 @@ async def profile_menu(
                             return _handler
 
                         with ui.column().classes('w-full q-gutter-y-sm'):
+                            # Отрисовываем адрес так, чтобы иконка и подписи оставались выровненными при переносах
+                            def _render_address_item(
+                                *,
+                                title: str,
+                                address: str,
+                                handler: Callable[[Any | None], Awaitable[None]],
+                            ) -> None:
+                                row = ui.row().classes('w-full items-start q-py-sm cursor-pointer gap-3')
+                                with row:
+                                    with ui.column().classes('w-full gap-1'):
+                                        with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                                            ui.icon('place').classes('text-body1 q-mt-xs')
+                                            ui.label(title).classes('text-body1')
+                                            ui.element('div').classes('flex-1')
+                                            ui.label(lang_dict('profile_address_edit', current_lang)).classes('text-caption text-grey-6')
+                                        with ui.row().classes('w-full items-center gap-2 wrap'):
+                                            ui.label(address).classes('text-body2 wrap').style('white-space:normal; word-break:break-word; text-align:left;')
+                                row.on('click', handler)
+
                             if addresses_map:
                                 for address_id, address_data in addresses_map.items():
-                                    display_value = (
-                                        f"{_address_display_name(address_id, address_data, current_lang)}: "
-                                        f"{address_data.get('address', '')}"
-                                    )
-                                    _kv(
-                                        'place',
-                                        'profile_address_edit',
-                                        display_value,
-                                        on_click=_make_address_handler(address_id),
+                                    name_to_display = _address_display_name(address_id, address_data, current_lang)
+                                    address_value = str(address_data.get('address') or '').strip()
+                                    if not address_value:
+                                        continue
+                                    _render_address_item(
+                                        title=name_to_display,
+                                        address=address_value,
+                                        handler=_make_address_handler(address_id),
                                     )
 
                             if len(addresses_map) < MAX_FAVORITE_ADDRESSES:
-                                _kv(
-                                    'add',
-                                    'profile_address_edit',
-                                    lang_dict('profile_address_add', current_lang),
-                                    on_click=_make_address_handler(None),
-                                )
+                                row_add = ui.row().classes('w-full items-center q-py-sm cursor-pointer gap-3')
+                                with row_add:
+                                    ui.icon('add').classes('text-body1')
+                                    ui.label(lang_dict('profile_address_add', current_lang)).classes('text-body1')
+                                    ui.element('div').classes('flex-1')
+                                    ui.label(lang_dict('profile_address_edit', current_lang)).classes('text-caption text-grey-6')
+                                row_add.on('click', _make_address_handler(None))
                             else:
-                                ui.label(
-                                    lang_dict(
-                                        'profile_address_limit_reached',
-                                        current_lang,
-                                        count=str(MAX_FAVORITE_ADDRESSES),
-                                    )
-                                ).classes('text-caption text-grey-6')
+                                with ui.row().classes('w-full'):
+                                    ui.label(
+                                        lang_dict(
+                                            'profile_address_limit_reached',
+                                            current_lang,
+                                            count=str(MAX_FAVORITE_ADDRESSES),
+                                        )
+                                    ).classes('text-caption text-grey-6')
             except Exception as e:
                 await _log(f"[profile_menu][personal][ОШИБКА] {e!r}", type_msg="error")
                 raise
 
         async def _render_car(content: ui.element) -> None:
             try:
+
                 async def _prepare_preview(path: str | None) -> str | None:
                     """Готовим сжатую копию для предпросмотра, если это изображение."""
                     if not path:
@@ -953,29 +1025,78 @@ async def profile_menu(
                         maximized=False,
                     )
 
-                async def _confirm_remove_image(field: str, title_key: str) -> None:
-                    async def _render_body(slot: ui.element) -> None:
-                        with slot:
-                            ui.label(lang_dict('profile_vehicle_image_remove_confirm', current_lang)).classes('text-body1')
-                            ui.label(lang_dict(title_key, current_lang)).classes('text-caption text-grey')
+                async def _open_update_dialog(field: str, title_key: str, kind_alias: str) -> None:
+                    """Диалог обновления документа с выбором нового файла."""
+                    try:
+                        dialog = ui.dialog().classes('w-full').props("persistent")
+                        progress_bar: ui.linear_progress | None = None
+                        uploader_ctrl: ui.upload | None = None
 
-                    async def _remove(_: Any | None = None) -> None:
-                        await _save(
-                            updates={field: None},
-                            section='car_data',
-                            ok_key='profile_vehicle_image_removed',
-                            err_key='profile_vehicle_image_remove_error',
+                        async def _close_dialog(_: Any | None = None) -> None:
+                            try:
+                                dialog.close()
+                                await _log(
+                                    "[profile_menu][car][update_dialog] закрыт пользователем",
+                                    type_msg="info",
+                                )
+                            except Exception as close_error:
+                                await _log(
+                                    f"[profile_menu][car][update_dialog][close][ОШИБКА] {close_error!r}",
+                                    type_msg="warning",
+                                )
+
+                        with dialog:
+                            with ui.card().classes("w-full gap-3"):
+                                ui.label(lang_dict(title_key, current_lang)).classes("text-subtitle1")
+                                ui.label(lang_dict('profile_vehicle_image_update_hint', current_lang)).classes("text-body2 text-grey")
+                                uploader_ctrl = ui.upload(
+                                    label=lang_dict('profile_vehicle_file_select', current_lang),
+                                ).classes('w-full').props('accept=".jpg,.jpeg,.png,.webp,.pdf" auto-upload max-files=1 color=primary flat no-caps')
+                                progress_bar = ui.linear_progress(value=0).classes('w-full')
+                                progress_bar.visible = False
+                                with ui.row().classes("w-full justify-end gap-2"):
+                                    ui.button(
+                                        lang_dict('profile_vehicle_image_close', current_lang),
+                                        on_click=_close_dialog,
+                                    ).props('color=primary flat')
+
+                        async def _on_upload(event: Any) -> None:
+                            if uploader_ctrl is None:
+                                return
+                            success = await _handle_upload_event(
+                                target_field=field,
+                                kind_alias=kind_alias,
+                                event_obj=event,
+                                progress_bar=progress_bar,
+                                uploader_ctrl=uploader_ctrl,
+                            )
+                            if success:
+                                try:
+                                    dialog.close()
+                                    await _log(
+                                        "[profile_menu][car][update_dialog] закрыт после обновления",
+                                        type_msg="info",
+                                    )
+                                except Exception as close_error:
+                                    await _log(
+                                        f"[profile_menu][car][update_dialog][close_after][ОШИБКА] {close_error!r}",
+                                        type_msg="warning",
+                                    )
+
+                        if uploader_ctrl is not None:
+                            uploader_ctrl.on_upload(_on_upload)
+
+                        dialog.open()
+                        await _log(
+                            "[profile_menu][car][update_dialog] открыт",
+                            type_msg="info",
                         )
-
-                    await show_action_dialog(
-                        lang=current_lang,
-                        actions=[
-                            ('profile_vehicle_image_remove', _remove),
-                            ('profile_support_cancel', None),
-                        ],
-                        body_renderer=_render_body,
-                        danger_keys={'profile_vehicle_image_remove'},
-                    )
+                    except Exception as update_dialog_error:
+                        await _log(
+                            f"[profile_menu][car][update_dialog][ОШИБКА] {update_dialog_error!r}",
+                            type_msg='error',
+                        )
+                        raise
 
                 with content:
                     async def _edit_brand(_: Any | None = None) -> None:
@@ -1011,8 +1132,11 @@ async def profile_menu(
                         event_obj: Any,
                         progress_bar: ui.linear_progress | None,
                         uploader_ctrl: ui.upload,
-                    ) -> None:
-                        # Обработчик загрузки: сохраняем файл и обновляем данные в разделе авто.
+                    ) -> bool:
+                        """Общая обработка загрузки документа с прогрессом."""
+                        global upload_successful
+                        new_file_path: str | None = None
+                        success: bool = False
                         try:
                             uploader_ctrl.disable()
                             file_name = (
@@ -1027,25 +1151,31 @@ async def profile_menu(
                                     f"[profile_menu][car][upload] запрещённое расширение: {ext}",
                                     type_msg='warning',
                                 )
-                                return
+                                return False
 
                             if progress_bar is not None:
                                 progress_bar.visible = True
                                 progress_bar.value = 0.0
 
-                            saved_path = await _save_upload(
+                            new_file_path = await _save_upload(
                                 uid,
                                 event_obj,
                                 kind_alias,
                                 progress_bar,
                                 lang=current_lang,
                             )
-                            await _save(
-                                updates={target_field: saved_path},
+
+                            update_ok = await _save(
+                                updates={target_field: new_file_path},
                                 section='car_data',
                                 ok_key='profile_vehicle_image_updated',
                                 err_key='profile_vehicle_image_update_error',
                             )
+
+                            if update_ok and new_file_path:
+                                success = True
+                                upload_successful = True
+                            return success
                         except Exception as upload_error:
                             await _log(
                                 f"[profile_menu][car][upload][ОШИБКА] {upload_error!r}",
@@ -1055,7 +1185,7 @@ async def profile_menu(
                                 lang_dict('profile_vehicle_image_update_error', current_lang),
                                 type='negative',
                             )
-                            raise
+                            return False
                         finally:
                             if progress_bar is not None:
                                 try:
@@ -1067,6 +1197,14 @@ async def profile_menu(
                                 uploader_ctrl.enable()
                             except Exception:
                                 pass
+                            if not success and new_file_path:
+                                try:
+                                    Path(new_file_path).unlink(missing_ok=True)
+                                except Exception as cleanup_error:
+                                    await _log(
+                                        f"[profile_menu][car][tmp_cleanup][ОШИБКА] {cleanup_error!r}",
+                                        type_msg='warning',
+                                    )
 
                     with ui.card().classes('w-full q-pa-md gap-3'):
                         ui.label(lang_dict('profile_vehicle_docs_title', current_lang)).classes('text-subtitle1')
@@ -1085,13 +1223,13 @@ async def profile_menu(
                                         async def _view(_: Any | None = None, f=field, t=title_key) -> None:
                                             await _show_image_dialog(f, t)
 
-                                        async def _remove(_: Any | None = None, f=field, t=title_key) -> None:
-                                            await _confirm_remove_image(f, t)
+                                        async def _update(_: Any | None = None, f=field, t=title_key, k=kind) -> None:
+                                            await _open_update_dialog(f, t, k)
                                     with ui.row().classes('gap-2 items-center wrap'):
                                         ui.button(
-                                            lang_dict('profile_vehicle_image_remove', current_lang),
-                                            on_click=_remove,
-                                        ).props('color=negative flat')
+                                            lang_dict('profile_vehicle_image_update', current_lang),
+                                            on_click=_update,
+                                        ).props('color=primary flat')
                                         ui.button(
                                             lang_dict('profile_vehicle_image_view', current_lang),
                                             on_click=_view,
@@ -1460,7 +1598,7 @@ async def profile_menu(
                     additional_input: ui.input | None = None
                     if additional:
                         additional_label = text_label_2 or text_label
-                        ui.label(lang_dict(additional_label, current_lang)).classes("text-caption text-grey-6")
+                        ui.label(lang_dict(additional_label, current_lang))
                         additional_value = "" if value_additional in (None, "") else str(value_additional)
                         additional_input = ui.input(value=additional_value).props("outlined dense clearable").classes("w-full")
                         if not additional_value:
@@ -1606,7 +1744,14 @@ async def profile_menu(
                             additional=additional,
                             value_main=initial_value,
                         )
+                        # Выбираем поле, для которого требуется автоподстановка адреса
+                        target_for_autocomplete: ui.input | None = None
                         if label_key == 'profile_address_value_edit':
+                            target_for_autocomplete = input_main
+                        elif label_key_2 == 'profile_address_value_edit':
+                            target_for_autocomplete = input_additional
+
+                        if target_for_autocomplete is not None:
                             try:
                                 suggestions_wrapper: ui.column | None = None
                                 with slot:
@@ -1618,11 +1763,11 @@ async def profile_menu(
 
                                 async def _attach_autocomplete() -> None:
                                     try:
-                                        if input_main is None or suggestions_wrapper is None:
+                                        if target_for_autocomplete is None or suggestions_wrapper is None:
                                             return
                                         country_alpha2 = await _country_alpha2(user.get('country'))
                                         await _setup_address_autocomplete_ui(
-                                            input_element=input_main,
+                                            input_element=target_for_autocomplete,
                                             suggestions_wrapper=suggestions_wrapper,
                                             lang=current_lang,
                                             country_alpha2=country_alpha2,
@@ -1998,9 +2143,9 @@ async def profile_menu(
                             ui.button(
                                 description,
                                 on_click=lambda _=None, value=description: asyncio.create_task(_apply_suggestion(value)),
-                            ).props("color=primary flat dense no-caps").classes(
-                                "full-width justify-start text-left",
-                            )
+                            ).props("color=primary flat dense no-caps align=left").classes(
+                                "w-full items-start justify-start text-left",
+                            ).style("justify-content:flex-start; text-align:left;")
                             if shown >= AUTOCOMPLETE_LIMIT:
                                 break
 

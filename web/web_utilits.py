@@ -3,6 +3,8 @@ import base64
 import imghdr
 import os
 import contextlib
+from datetime import datetime
+from uuid import uuid4
 from typing import Any, Sequence, Optional
 from nicegui import ui, app
 from pathlib import Path
@@ -101,9 +103,12 @@ async def _save_upload(uid: int, e, kind: str, progress=None, lang: str | None =
           uid=uid,
         )
         raise ValueError(lang_dict('upload_error_invalid_type', safe_lang, exts=ext_hint))
-      path = user_dir / f'{kind}{ext}'
 
-      # потоковая запись с прогрессом
+      timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+      unique_suffix = uuid4().hex[:6]
+      path = user_dir / f"{kind}_{timestamp}_{unique_suffix}{ext}"
+
+      # сохраняем с уникальным именем, чтобы не перезаписывать предыдущие загрузки
       get_sz = getattr(fobj, 'size', None)
       total = get_sz() if callable(get_sz) else (int(get_sz) if get_sz is not None else None)
 
@@ -132,7 +137,10 @@ async def _save_upload(uid: int, e, kind: str, progress=None, lang: str | None =
         uid=uid,
       )
       raise ValueError(lang_dict('upload_error_invalid_type', safe_lang, exts=ext_hint))
-    path = user_dir / f'{kind}{ext}'
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    unique_suffix = uuid4().hex[:6]
+    path = user_dir / f"{kind}_{timestamp}_{unique_suffix}{ext}"
 
     src = getattr(e, 'content', None)
     if src is None:
