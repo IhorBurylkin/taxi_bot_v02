@@ -7,12 +7,15 @@ import asyncio
 import base64
 import hashlib
 import hmac
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import LabeledPrice
 from nicegui import ui, app
 from yarl import URL
 from web.web_start_reg_form import start_reg_form_ui
@@ -32,6 +35,7 @@ from config.config import (
     DEFAULT_LANGUAGES,
     GMAPS_API_KEY,
     GMAPS_URL_SIGNING_SECRET,
+    _BALANCE_PRESETS,
 )
 from config.config_utils import lang_dict
 from db.db_utils import delete_user, update_table
@@ -1261,36 +1265,600 @@ async def profile_menu(
 
         async def _render_balance(content: ui.element) -> None:
             try:
-                async def _open_balance_dialog(_: Any | None = None) -> None:
-                    async def _updates_factory(value: str, _secondary: str | None) -> dict[str, Any]:
-                        cleaned_raw = (value or '').strip().replace(' ', '').replace(',', '.')
-                        if not cleaned_raw:
-                            raise ValueError('profile_balance_invalid_amount')
-                        try:
-                            amount_decimal = Decimal(cleaned_raw)
-                        except InvalidOperation as invalid_amount:
-                            await _log(f"[profile_menu][balance][parse][ОШИБКА] {invalid_amount!r}", type_msg='warning')
-                            raise ValueError('profile_balance_invalid_amount')
-                        return {'balance': float(amount_decimal)}
+                raw_balance = user.get('balance')
+                try:
+                    balance_value = Decimal(str(raw_balance)) if raw_balance is not None else Decimal('0')
+                except (InvalidOperation, TypeError):
+                    balance_value = Decimal('0')
 
-                    await _open_input_dialog(
-                        initial_value=str(user.get('balance') or 0),
-                        label_key='profile_balance_amount_label',
-                        action_key='profile_balance_save',
-                        updates_factory=_updates_factory,
-                        section='balance',
-                        ok_key='profile_balance_updated',
-                        err_key='profile_balance_update_error',
+                transactions_list: list[dict[str, Any]] = (
+                    user.get('transactions') if isinstance(user.get('transactions'), list) else []
+                )
+
+                preset_values: list[Decimal] = []
+                for preset in _BALANCE_PRESETS or []:
+                    try:
+                        preset_decimal = Decimal(str(preset))
+                    except (InvalidOperation, TypeError):
+                        continue
+                    if preset_decimal > 0:
+                        preset_values.append(preset_decimal)
+
+                selected_amount: dict[str, Decimal | None] = {'value': preset_values[0] if preset_values else None}
+                filter_state: dict[str, Any] = {'mode': 'all', 'start': None, 'end': None}
+
+                def _parse_timestamp(tx: Mapping[str, Any]) -> datetime:
+                    """Парсим временную метку транзакции, fallback на эпоху."""
+                    candidates = (
+                        tx.get('created_at'),
+                        tx.get('createdAt'),
+                        tx.get('timestamp'),
+                        tx.get('date'),
                     )
+                    for candidate in candidates:
+                        if candidate is None:
+                            continue
+                        try:
+                            if isinstance(candidate, (int, float)):
+                                return datetime.fromtimestamp(float(candidate), tz=timezone.utc)
+                            candidate_str = str(candidate).strip()
+                            if candidate_str.isdigit():
+                                return datetime.fromtimestamp(float(candidate_str), tz=timezone.utc)
+                            parsed = datetime.fromisoformat(candidate_str)
+                            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                        except (ValueError, TypeError):
+                            continue
+                    return datetime.fromtimestamp(0, tz=timezone.utc)
+
+                def _translate_direction(value: str | None) -> str:
+                    key = f"profile_balance_tx_direction_{(value or '').lower()}"
+                    try:
+                        return lang_dict(key, current_lang)
+                    except KeyError:
+                        return value or '-'
+
+                def _translate_status(value: str | None) -> str:
+                    key = f"profile_balance_tx_status_{(value or '').lower()}"
+                    try:
+                        return lang_dict(key, current_lang)
+                    except KeyError:
+                        return value or '-'
+
+                def _format_amount(value: Any, direction: str | None) -> str:
+                    try:
+                        amount_decimal = Decimal(str(value))
+                    except (InvalidOperation, TypeError):
+                        amount_decimal = Decimal('0')
+                    sign = '-' if (direction or '').lower() == 'outbound' else '+'
+                    if amount_decimal == amount_decimal.to_integral_value():
+                        amount_text = str(int(amount_decimal))
+                    else:
+                        amount_text = str(amount_decimal.normalize())
+                    return f"{sign}{amount_text}"
+
+                def _filter_transactions() -> list[dict[str, Any]]:
+                    now_utc = datetime.now(timezone.utc)
+                    start_dt: datetime | None = None
+                    end_dt: datetime | None = None
+                    mode = (filter_state.get('mode') or 'all').lower()
+
+                    if mode == 'today':
+                        start_dt = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                        end_dt = now_utc
+                    elif mode == 'week':
+                        start_dt = now_utc - timedelta(days=7)
+                        end_dt = now_utc
+                    elif mode == 'month':
+                        start_dt = now_utc - timedelta(days=30)
+                        end_dt = now_utc
+                    elif mode == 'year':
+                        start_dt = now_utc - timedelta(days=365)
+                        end_dt = now_utc
+                    elif mode == 'custom':
+                        start_dt = filter_state.get('start')
+                        end_dt = filter_state.get('end')
+
+                    filtered: list[dict[str, Any]] = []
+                    for tx in transactions_list:
+                        if not isinstance(tx, Mapping):
+                            continue
+                        tx_dt = _parse_timestamp(tx)
+                        if start_dt and tx_dt < start_dt:
+                            continue
+                        if end_dt and tx_dt > end_dt:
+                            continue
+                        filtered.append(dict(tx))
+
+                    filtered.sort(key=lambda item: _parse_timestamp(item), reverse=True)
+                    return filtered
+
+                history_container: ui.column | None = None
+
+                def _refresh_history() -> None:
+                    """Перерисовываем список транзакций согласно фильтру."""
+                    if history_container is None:
+                        return
+                    history_container.clear()
+                    with history_container:
+                        filtered = _filter_transactions()
+                        if not filtered:
+                            ui.label(lang_dict('profile_balance_history_empty', current_lang)).classes('text-caption text-grey')
+                            return
+                        for tx in filtered:
+                            tx_direction = str(tx.get('direction') or '').lower()
+                            direction_text = _translate_direction(tx_direction)
+                            status_text = _translate_status(tx.get('status'))
+                            ts_text = _parse_timestamp(tx).astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M')
+                            amount_source = tx.get('amount_stars') or tx.get('amount')
+                            amount_text = _format_amount(amount_source, tx_direction)
+                            ui.label(
+                                lang_dict(
+                                    'profile_balance_tx_item',
+                                    current_lang,
+                                    timestamp=ts_text,
+                                    direction=direction_text,
+                                    status=status_text,
+                                    amount=amount_text,
+                                )
+                            ).classes('text-body2')
+
+                def _extract_invoice_slug(url_value: str | None) -> str | None:
+                    """Возвращает slug счёта из ссылки Telegram Stars."""
+                    if not url_value:
+                        return None
+                    try:
+                        parsed = URL(url_value)
+                        slug = parsed.query.get('startapp')
+                        if slug:
+                            return slug
+                        parts = [segment for segment in parsed.path.split('/') if segment]
+                        return parts[-1] if parts else None
+                    except Exception:
+                        return None
+
+                async def _issue_stars_invoice(
+                    *,
+                    amount: int,
+                    order_id: str,
+                    payload: str,
+                    transaction_title: str,
+                    transaction_description: str,
+                ) -> dict[str, Any]:
+                    """Отправляет счёт на оплату в звёздах и возвращает детали операции."""
+                    result: dict[str, Any] = {
+                        'ok': False,
+                        'message_id': None,
+                        'invoice_url': None,
+                        'slug': None,
+                        'error': None,
+                    }
+
+                    try:
+                        from bot_instance import bot as main_bot  # type: ignore
+                    except Exception as import_error:
+                        await _log(
+                            f"[profile_menu][balance][invoice] ошибка импорта bot_instance: {import_error!r}",
+                            type_msg='error',
+                        )
+                        result['error'] = repr(import_error)
+                        return result
+
+                    if main_bot is None:
+                        await _log(
+                            "[profile_menu][balance][invoice] основной бот не инициализирован",
+                            type_msg='error',
+                        )
+                        result['error'] = 'bot_not_initialized'
+                        return result
+
+                    price_label = lang_dict('profile_balance_topup_invoice_item', current_lang, amount=str(amount))
+                    prices = [LabeledPrice(label=price_label[:32], amount=amount)]
+
+                    try:
+                        invoice_message = await main_bot.send_invoice(
+                            chat_id=uid,
+                            title=transaction_title,
+                            description=transaction_description,
+                            payload=payload,
+                            currency="XTR",
+                            prices=prices,
+                            start_parameter=order_id[:64],
+                        )
+                        result['message_id'] = getattr(invoice_message, 'message_id', None)
+                        result['ok'] = True
+                        await _log(
+                            f"[profile_menu][balance][invoice] счёт отправлен order_id={order_id}",
+                            type_msg='info',
+                        )
+                    except TelegramBadRequest as api_error:
+                        await _log(
+                            f"[profile_menu][balance][invoice] ошибка send_invoice: {api_error!r}",
+                            type_msg='error',
+                        )
+                        result['error'] = str(api_error)
+                        return result
+                    except Exception as send_error:
+                        await _log(
+                            f"[profile_menu][balance][invoice] непредвиденная ошибка send_invoice: {send_error!r}",
+                            type_msg='error',
+                        )
+                        result['error'] = repr(send_error)
+                        return result
+
+                    try:
+                        invoice_url = await main_bot.create_invoice_link(
+                            title=transaction_title,
+                            description=transaction_description,
+                            payload=payload,
+                            currency="XTR",
+                            prices=prices,
+                        )
+                        result['invoice_url'] = invoice_url
+                        result['slug'] = _extract_invoice_slug(invoice_url)
+                    except TelegramBadRequest as link_error:
+                        await _log(
+                            f"[profile_menu][balance][invoice_link] ошибка create_invoice_link: {link_error!r}",
+                            type_msg='warning',
+                        )
+                    except Exception as link_unexpected:
+                        await _log(
+                            f"[profile_menu][balance][invoice_link] непредвиденная ошибка: {link_unexpected!r}",
+                            type_msg='warning',
+                        )
+
+                    return result
+
+                async def _handle_topup(amount: Decimal) -> None:
+                    try:
+                        if not uid:
+                            ui.notify(lang_dict('profile_balance_topup_error', current_lang), type='negative')
+                            await _log('[profile_menu][balance] отсутствует uid для пополнения', type_msg='error')
+                            return
+
+                        amount_int = int(amount)
+                        if amount_int <= 0:
+                            ui.notify(lang_dict('profile_balance_topup_missing_amount', current_lang), type='warning')
+                            await _log('[profile_menu][balance] указана некорректная сумма пополнения', type_msg='warning')
+                            return
+
+                        now_dt = datetime.now(timezone.utc)
+                        timestamp_unix = int(now_dt.timestamp())
+                        order_suffix = now_dt.strftime('%Y%m%d%H%M%S')
+                        order_id = f"TOPUP-{uid}-{order_suffix}"
+                        transaction_id = f"tgst_{order_suffix}_{uuid4().hex[:6]}"
+                        payload_dict = {'order_id': order_id, 'amount': amount_int}
+                        payload = json.dumps(payload_dict, ensure_ascii=False)
+
+                        transaction_title = lang_dict('profile_balance_topup_invoice_title', current_lang)
+                        transaction_description = lang_dict('profile_balance_topup_invoice_description', current_lang)
+
+                        transaction_record: dict[str, Any] = {
+                            'id': transaction_id,
+                            'tg_transaction_id': None,
+                            'order_id': order_id,
+                            'user_id': uid,
+                            'bot_id': None,
+                            'direction': 'inbound',
+                            'status': 'pending',
+                            'amount_stars': amount_int,
+                            'amount': float(amount),
+                            'currency': 'XTR',
+                            'title': transaction_title,
+                            'description': transaction_description,
+                            'peer_type': None,
+                            'peer_id': None,
+                            'tg_payload': payload,
+                            'created_at': timestamp_unix,
+                            'completed_at': None,
+                            'performed_at': None,
+                            'invoice_url': None,
+                            'invoice_slug': None,
+                            'invoice_message_id': None,
+                            'is_refund': False,
+                            'raw': {'payload': payload_dict},
+                        }
+
+                        invoice_result = await _issue_stars_invoice(
+                            amount=amount_int,
+                            order_id=order_id,
+                            payload=payload,
+                            transaction_title=transaction_title,
+                            transaction_description=transaction_description,
+                        )
+
+                        if invoice_result.get('ok'):
+                            transaction_record['invoice_url'] = invoice_result.get('invoice_url')
+                            transaction_record['invoice_slug'] = invoice_result.get('slug')
+                            transaction_record['invoice_message_id'] = invoice_result.get('message_id')
+                        else:
+                            transaction_record['status'] = 'failed'
+                            transaction_record['raw']['invoice_error'] = invoice_result.get('error')
+
+                        updated_transactions = list(transactions_list)
+                        updated_transactions.append(transaction_record)
+
+                        async def _after_ok() -> None:
+                            user['transactions'] = updated_transactions
+
+                        updates = {
+                            'transactions': json.dumps(updated_transactions, ensure_ascii=False),
+                        }
+
+                        ok = await _save(
+                            updates=updates,
+                            section='balance',
+                            ok_key='profile_balance_topup_success',
+                            err_key='profile_balance_topup_error',
+                            on_after_ok=_after_ok,
+                            merge_state=False,
+                        )
+
+                        if ok:
+                            transactions_list.clear()
+                            transactions_list.extend(updated_transactions)
+                            _refresh_history()
+
+                            if invoice_result.get('ok'):
+                                ui.notify(lang_dict('profile_balance_topup_invoice_sent', current_lang), type='positive')
+                                invoice_url = invoice_result.get('invoice_url')
+                                if invoice_url:
+                                    try:
+                                        js_payload = json.dumps(
+                                            {
+                                                'url': invoice_url,
+                                                'slug': invoice_result.get('slug'),
+                                            }
+                                        )
+                                        js_code = f"""
+                                            (function() {{
+                                                try {{
+                                                    const data = {js_payload};
+                                                    const pickSlug = (info) => {{
+                                                        if (info.slug) {{ return info.slug; }}
+                                                        if (!info.url) {{ return null; }}
+                                                        try {{
+                                                            const u = new URL(info.url);
+                                                            return u.searchParams.get('startapp') || u.pathname.split('/').filter(Boolean).pop();
+                                                        }} catch (_err) {{
+                                                            return null;
+                                                        }}
+                                                    }};
+                                                    const slug = pickSlug(data);
+                                                    if (!slug) {{ return; }}
+                                                    if (window.Telegram?.WebApp?.openInvoice) {{
+                                                        window.Telegram.WebApp.openInvoice(slug, function(status) {{
+                                                            console.log('openInvoice status', status);
+                                                        }});
+                                                    }}
+                                                }} catch (err) {{
+                                                    console.error('openInvoice failed', err);
+                                                }}
+                                            }})();
+                                        """
+                                        await ui.run_javascript(js_code)
+                                    except Exception as open_error:
+                                        await _log(
+                                            f"[profile_menu][balance][invoice_webapp] не удалось открыть счёт в WebApp: {open_error!r}",
+                                            type_msg='warning',
+                                        )
+                            else:
+                                ui.notify(lang_dict('profile_balance_topup_invoice_error', current_lang), type='warning')
+                                await _log(
+                                    f"[profile_menu][balance] счёт не отправлен order_id={order_id}: {invoice_result.get('error')}",
+                                    type_msg='warning',
+                                )
+
+                    except Exception as topup_error:
+                        await _log(
+                            f"[profile_menu][balance][topup][ОШИБКА] {topup_error!r}",
+                            type_msg='error',
+                        )
+                        ui.notify(lang_dict('profile_balance_topup_error', current_lang), type='negative')
+                        raise
+
+                async def _open_topup_dialog(_: Any | None = None) -> None:
+                    try:
+                        if not preset_values:
+                            ui.notify(lang_dict('profile_balance_topup_error', current_lang), type='warning')
+                            await _log('[profile_menu][balance] нет предустановок для пополнения', type_msg='warning')
+                            return
+
+                        preset_options = {str(int(p)): f"{int(p)} ⭐" for p in preset_values}
+
+                        async def _render_body(slot: ui.element) -> None:
+                            try:
+                                with slot:
+                                    ui.label(lang_dict('profile_balance_topup_dialog_title', current_lang)).classes('text-subtitle1')
+                                    with ui.row().classes('w-full items-center gap-3 wrap'):
+                                        amount_select = (
+                                            ui.select(
+                                                preset_options,
+                                                value=(str(int(selected_amount['value'])) if selected_amount['value'] else None),
+                                                with_input=False,
+                                            )
+                                            .props('outlined dense')
+                                            .classes('w-full')
+                                        )
+                                        amount_select.props(
+                                            f"placeholder=\"{lang_dict('profile_balance_topup_select_placeholder', current_lang)}\""
+                                        )
+
+                                        async def _on_amount_change(e: ui.events.ValueChangeEventArguments) -> None:
+                                            try:
+                                                raw_value = str(e.value or '').strip()
+                                                selected_amount['value'] = Decimal(raw_value) if raw_value else None
+                                                await _log(
+                                                    f"[profile_menu][balance] выбран пресет {raw_value}",
+                                                    type_msg='info',
+                                                )
+                                            except (InvalidOperation, TypeError):
+                                                selected_amount['value'] = None
+                                                await _log(
+                                                    "[profile_menu][balance] некорректное значение пресета",
+                                                    type_msg='warning',
+                                                )
+
+                                        amount_select.on_value_change(_on_amount_change)
+                            except Exception as body_error:
+                                await _log(
+                                    f"[profile_menu][balance][dialog_body][ОШИБКА] {body_error!r}",
+                                    type_msg='error',
+                                )
+                                raise
+
+                        async def _confirm(_: Any | None = None) -> None:
+                            amount = selected_amount['value']
+                            if amount is None:
+                                ui.notify(lang_dict('profile_balance_topup_missing_amount', current_lang), type='warning')
+                                await _log('[profile_menu][balance] сумма пополнения не выбрана', type_msg='warning')
+                                return
+                            await _handle_topup(amount)
+
+                        await show_action_dialog(
+                            lang=current_lang,
+                            actions=[('profile_balance_topup_confirm', _confirm)],
+                            body_renderer=_render_body,
+                            persistent=True,
+                            maximized=False,
+                        )
+                    except Exception as dialog_error:
+                        await _log(
+                            f"[profile_menu][balance][dialog][ОШИБКА] {dialog_error!r}",
+                            type_msg='error',
+                        )
+                        raise
+
+                async def _handle_withdraw(_: Any | None = None) -> None:
+                    try:
+                        await _log('[profile_menu][balance] нажата кнопка вывода средств', type_msg='info')
+                        ui.notify(lang_dict('profile_balance_withdraw_notice', current_lang), type='positive')
+                        info_text = (
+                            f"🔴 Запрос на вывод средств от пользователя:\n"
+                            f"user_id: {uid or 'неизвестен'}\n"
+                            f"first_name: {user.get('first_name', '')} {user.get('last_name', '')}\n"
+                            f"username: @{user.get('username', '')}\n"
+                            f"Баланс: {balance_value}."
+                        )
+                        await send_info_msg(info_text, type_msg_tg="payments")
+                    except Exception as withdraw_error:
+                        await _log(
+                            f"[profile_menu][balance][withdraw][ОШИБКА] {withdraw_error!r}",
+                            type_msg='error',
+                        )
+                        ui.notify(lang_dict('profile_balance_withdraw_error', current_lang), type='negative')
+                        raise
 
                 with content:
                     with ui.card().classes('w-full q-pa-md gap-3'):
-                        amount = user.get('balance') or 0
-                        ui.label(lang_dict('profile_balance_value', current_lang, amount=str(amount))).classes('text-h6')
-                        ui.button(
-                            lang_dict('profile_balance_edit', current_lang),
-                            on_click=_open_balance_dialog,
-                        ).props('color=primary unelevated')
+                        try:
+                            balance_text = f"{balance_value.quantize(Decimal('0.01'))}"
+                        except (InvalidOperation, ValueError):
+                            balance_text = str(balance_value)
+                        ui.label(
+                            lang_dict('profile_balance_value', current_lang, amount=str(balance_text))
+                        ).classes('text-h6')
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.button(
+                                lang_dict('profile_balance_topup', current_lang),
+                                on_click=_open_topup_dialog,
+                            ).props('color=primary flat')
+                            ui.button(
+                                lang_dict('profile_balance_withdraw', current_lang),
+                                on_click=_handle_withdraw,
+                            ).props('color=primary flat')
+
+                    with ui.card().classes('w-full q-pa-md gap-3'):
+                        ui.label(lang_dict('profile_balance_history_title', current_lang)).classes('text-subtitle1')
+                        filter_options = {
+                            'today': lang_dict('profile_balance_filter_today', current_lang),
+                            'week': lang_dict('profile_balance_filter_week', current_lang),
+                            'month': lang_dict('profile_balance_filter_month', current_lang),
+                            'year': lang_dict('profile_balance_filter_year', current_lang),
+                            'all': lang_dict('profile_balance_filter_all', current_lang),
+                            'custom': lang_dict('profile_balance_filter_custom', current_lang),
+                        }
+                        ui.label(lang_dict('profile_balance_filter_label', current_lang)).classes('text-body2')
+                        filter_select = (
+                            ui.select(filter_options, value='all', with_input=False)
+                            .props('outlined dense')
+                            .classes('w-full')
+                        )
+
+                        custom_row = ui.row().classes('w-full gap-3 wrap')
+                        custom_row.visible = False
+                        with custom_row:
+                            start_input = (
+                                ui.input(label=lang_dict('profile_balance_filter_start', current_lang))
+                                .props('type=date outlined dense')
+                                .classes('w-full')
+                            )
+                            end_input = (
+                                ui.input(label=lang_dict('profile_balance_filter_end', current_lang))
+                                .props('type=date outlined dense')
+                                .classes('w-full')
+                            )
+
+                            async def _apply_custom(_: Any | None = None) -> None:
+                                try:
+                                    start_raw = (start_input.value or '').strip()
+                                    end_raw = (end_input.value or '').strip()
+                                    if not start_raw or not end_raw:
+                                        ui.notify(lang_dict('profile_balance_filter_invalid_range', current_lang), type='warning')
+                                        return
+
+                                    start_dt = datetime.strptime(start_raw, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                                    end_dt_base = datetime.strptime(end_raw, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                                    end_dt = (end_dt_base + timedelta(days=1))
+
+                                    if start_dt >= end_dt:
+                                        ui.notify(lang_dict('profile_balance_filter_invalid_range', current_lang), type='warning')
+                                        return
+
+                                    filter_state['start'] = start_dt
+                                    filter_state['end'] = end_dt
+                                    await _log('[profile_menu][balance] применён кастомный фильтр', type_msg='info')
+                                    _refresh_history()
+                                except ValueError:
+                                    ui.notify(lang_dict('profile_balance_filter_invalid_range', current_lang), type='warning')
+                                    await _log('[profile_menu][balance] неверный формат дат фильтра', type_msg='warning')
+                                except Exception as range_error:
+                                    await _log(
+                                        f"[profile_menu][balance][filter_custom][ОШИБКА] {range_error!r}",
+                                        type_msg='error',
+                                    )
+                                    ui.notify(lang_dict('profile_balance_filter_invalid_range', current_lang), type='negative')
+                                    raise
+
+                            ui.button(
+                                lang_dict('profile_balance_filter_apply', current_lang),
+                                on_click=_apply_custom,
+                            ).props('color=primary flat')
+
+                        async def _on_filter_change(e: ui.events.ValueChangeEventArguments) -> None:
+                            try:
+                                new_mode = str(e.value or 'all').lower()
+                                filter_state['mode'] = new_mode
+                                if new_mode != 'custom':
+                                    filter_state['start'] = None
+                                    filter_state['end'] = None
+                                custom_row.visible = new_mode == 'custom'
+                                await _log(
+                                    f"[profile_menu][balance] выбран фильтр {new_mode}",
+                                    type_msg='info',
+                                )
+                                _refresh_history()
+                            except Exception as change_error:
+                                await _log(
+                                    f"[profile_menu][balance][filter_change][ОШИБКА] {change_error!r}",
+                                    type_msg='error',
+                                )
+                                ui.notify(lang_dict('profile_balance_filter_invalid_range', current_lang), type='negative')
+                                raise
+
+                        filter_select.on_value_change(_on_filter_change)
+
+                        history_container = ui.column().classes('w-full gap-2')
+                        _refresh_history()
             except Exception as e:
                 await _log(f'[profile_menu][balance][ОШИБКА] {e!r}', type_msg='error')
                 raise

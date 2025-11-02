@@ -10,6 +10,7 @@ from config.config import (
     LOGGING_SETTINGS_TO_SEND_NEW_USERS,
     LOGGING_SETTINGS_TO_SEND_ORDERS,
     LOGGING_SETTINGS_TO_SEND_SUPPORT,
+    LOGGING_SETTINGS_TO_SEND_PAYMENTS,
     LOGGING_FILE_PATH_ADMINS,
 )
 _initialized = False
@@ -133,6 +134,8 @@ async def send_info_msg(
         settings = LOGGING_SETTINGS_TO_SEND_SUPPORT
     elif type_msg_tg == "warning":
         settings = LOGGING_SETTINGS_TO_SEND_ERRORS
+    elif type_msg_tg == "payments":
+        settings = LOGGING_SETTINGS_TO_SEND_PAYMENTS
 
     # Если запрещено — выходим тихо
     if not settings.get("permission", True):
