@@ -19,7 +19,7 @@ from config.config_from_db import ensure_config_exists
 from db.db_table_init import close_pool, create_pool, init_db_tables, monitor_pool_health
 from log.log import log_info, set_info_bot
 from log.server_logs_scheduler import send_server_logs_once, start_daily_server_logs_task
-from handlers import commands, verification
+from handlers import commands, verification, support
 from web.web_app import start_server
 
 _autosave_task: asyncio.Task | None = None
@@ -120,10 +120,12 @@ async def main() -> None:
         # 1) Боты
         bot, dp, info_bot, info_dp = await initialize_bots()
         set_info_bot(info_bot)
-
+        support.set_main_bot(bot)
         dp.include_router(commands.router)
+        dp.include_router(support.router)
 
         info_dp.include_router(verification.router)
+        info_dp.include_router(support.admin_router)
 
         loop = asyncio.get_running_loop()
         shutdown_event: asyncio.Event = asyncio.Event()

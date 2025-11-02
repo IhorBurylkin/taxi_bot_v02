@@ -1,8 +1,8 @@
 import asyncio
 import base64
+import contextlib
 import imghdr
 import os
-import contextlib
 from datetime import datetime
 from uuid import uuid4
 from typing import Any, Sequence, Optional
@@ -35,22 +35,80 @@ docs_spec: list[tuple[str, str, str]] = [
 
 def _digits(s: str) -> str: return ''.join(ch for ch in (s or '') if ch.isdigit())
 
-async def _safe_js(code: str, *, timeout: float = 3.0) -> bool:
+async def _safe_js(code: str, *, timeout: float = 3.0, target: Any | None = None) -> bool:
+  """Безопасный запуск JavaScript с проверкой состояния клиента."""
+  client_obj: Any | None = None
+  client_id: Any | None = None
+
+  if target is not None:
+    client_obj = getattr(target, "client", None)
+  if client_obj is None:
+    client_obj = getattr(ui.context, "client", None)
+  if client_obj is not None:
+    client_id = getattr(client_obj, "id", None)
+
+  def _client_active() -> bool:
+    """Проверяем, существует ли клиент в реестре NiceGUI."""
+    if client_obj is None:
+      return True
     try:
+      instances = getattr(client_obj, "instances", None)
+      if isinstance(instances, dict) and client_id is not None:
+        return client_id in instances
+    except Exception as state_error:
+      asyncio.create_task(
+        log_info(
+          f"[js][проверка клиента] ошибка состояния: {state_error!r}",
+          type_msg="warning",
+          client_id=client_id,
+        )
+      )
+    return True
+
+  if not _client_active():
+    await log_info(
+      f"[js][пропуск] клиент {client_id or 'неизвестен'} отключён, пропускаем выполнение JS",
+      type_msg="info",
+      client_id=client_id,
+    )
+    return False
+  try:
+    if target is not None:
+      # приоритет: run_javascript элемента, затем клиента
+      if hasattr(target, "run_javascript"):
+        await target.run_javascript(code, timeout=timeout)
+      elif hasattr(target, "client") and getattr(target, "client", None) is not None:
+        client_obj = target.client
+        if hasattr(client_obj, "run_javascript"):
+          await client_obj.run_javascript(code, timeout=timeout)
+        else:
+          await ui.run_javascript(code, timeout=timeout)
+      else:
         await ui.run_javascript(code, timeout=timeout)
-        return True
-    except TimeoutError as te:
-        await log_info(
-            f"[js][TIMEOUT] {te!r} | code={code[:80]!r}",
-            type_msg="warning",
-        )
-        return False
-    except Exception as e:
-        await log_info(
-            f"[js][ОШИБКА] {e!r} | code={code[:80]!r}",
-            type_msg="error",
-        )
-        return False
+    else:
+      await ui.run_javascript(code, timeout=timeout)
+    return True
+  except TimeoutError as te:
+    if not _client_active():
+      await log_info(
+        f"[js][пропуск] клиент {client_id or 'неизвестен'} отключился во время выполнения JS",
+        type_msg="info",
+        client_id=client_id,
+      )
+      return False
+    await log_info(
+      f"[js][таймаут {timeout:.1f} с] {te!r} | фрагмент={code[:80]!r}",
+      type_msg="warning",
+      client_id=client_id,
+    )
+    return False
+  except Exception as e:
+    await log_info(
+      f"[js][ошибка] {e!r} | фрагмент={code[:80]!r}",
+      type_msg="error",
+      client_id=client_id,
+    )
+    return False
 
 async def _get_uid() -> int | None:
     js = """

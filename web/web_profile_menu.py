@@ -16,7 +16,7 @@ from uuid import uuid4
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import LabeledPrice
-from nicegui import ui, app
+from nicegui import ui, app, context
 from yarl import URL
 from web.web_start_reg_form import start_reg_form_ui
 from web.web_utilits import (
@@ -24,7 +24,8 @@ from web.web_utilits import (
     bind_enter_action,
     fetch_telegram_avatar,
     _save_upload,
-    verify_driver
+    _safe_js,
+    verify_driver,
 )
 
 from log.log import log_info, send_info_msg
@@ -38,7 +39,13 @@ from config.config import (
     _BALANCE_PRESETS,
 )
 from config.config_utils import lang_dict
-from db.db_utils import delete_user, update_table
+from db.db_utils import (
+    delete_user,
+    update_table,
+    get_support_thread,
+    append_support_message,
+    mark_support_thread_read,
+)
 
 try:  # Pillow может отсутствовать в среде
     from PIL import Image  # type: ignore
@@ -86,6 +93,145 @@ async def profile_menu(
 
     gmaps_session: ClientSession | None = None
     gmaps_session_lock = asyncio.Lock()
+
+    SUPPORT_POLL_INTERVAL_SEC: float = 10.0
+
+    support_state_lock = asyncio.Lock()
+    app.storage.user.setdefault("support_thread", {"items": [], "cursors": {}, "meta": {}})
+    app.storage.user.setdefault("support_thread_version", 0)
+    app.storage.user.setdefault("support_has_unread", False)
+    support_thread_cache: dict[str, Any] = dict(
+        app.storage.user.get("support_thread") or {"items": [], "cursors": {}, "meta": {}}
+    )
+
+    def _parse_support_ts_raw(value: str | None) -> datetime | None:
+        """Превращает ISO8601-строку в datetime или возвращает None."""
+        if not value:
+            return None
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+
+    def _has_unread_admin(thread: dict[str, Any]) -> bool:
+        """Определяет, есть ли у пользователя непрочитанные ответы администрации."""
+        items = thread.get("items")
+        if not isinstance(items, list):
+            return False
+        last_admin_ts: str | None = None
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("author") == "admin" and isinstance(item.get("ts"), str):
+                last_admin_ts = item.get("ts")
+                break
+        if not last_admin_ts:
+            return False
+        last_admin_dt = _parse_support_ts_raw(last_admin_ts)
+        if last_admin_dt is None:
+            return False
+        cursors = thread.get("cursors") if isinstance(thread.get("cursors"), dict) else {}
+        user_cursor_dt = _parse_support_ts_raw(cursors.get("user_last_read")) if isinstance(cursors, dict) else None
+        if user_cursor_dt is None:
+            return True
+        return last_admin_dt > user_cursor_dt
+
+    def _bump_support_version() -> int:
+        """Увеличивает версию локального состояния чата для реактивных биндов."""
+        current_version = int(app.storage.user.get("support_thread_version") or 0) + 1
+        app.storage.user["support_thread_version"] = current_version
+        return current_version
+
+    async def _sync_support_state(
+        *,
+        mark_read: bool,
+        reason: str,
+        on_update: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Обновляет кеш диалога из БД и, при необходимости, помечает сообщения прочитанными."""
+        nonlocal support_thread_cache
+
+        if not uid:
+            return support_thread_cache
+
+        async with support_state_lock:
+            try:
+                thread = await get_support_thread(uid)
+            except Exception as load_error:
+                await _log(
+                    f"[profile_menu][support][ОШИБКА] не удалось обновить диалог: {load_error!r}",
+                    type_msg="error",
+                )
+                return support_thread_cache
+
+            items = thread.get("items") if isinstance(thread.get("items"), list) else []
+
+            if mark_read and items:
+                last_item_ts = None
+                for item in items:
+                    if isinstance(item, dict) and isinstance(item.get("ts"), str):
+                        last_item_ts = item.get("ts")
+                if last_item_ts:
+                    mark_ok = await mark_support_thread_read(uid, "user", last_item_ts)
+                    if mark_ok:
+                        thread.setdefault("cursors", {})["user_last_read"] = last_item_ts
+                    else:
+                        await _log(
+                            "[profile_menu][support] не удалось обновить курсор прочтения", type_msg="warning"
+                        )
+
+            support_thread_cache = thread
+            has_unread = _has_unread_admin(thread)
+            app.storage.user["support_thread"] = thread
+            app.storage.user["support_has_unread"] = has_unread
+            _bump_support_version()
+
+            # await _log(
+            #     f"[profile_menu][support] синхронизация: {reason}, непрочитанные={has_unread}",
+            #     type_msg="info",
+            # )
+
+            if on_update is not None:
+                try:
+                    on_update(thread)
+                except Exception as callback_error:
+                    await _log(
+                        f"[profile_menu][support][callback][ОШИБКА] {callback_error!r}",
+                        type_msg="warning",
+                    )
+
+            return thread
+
+    async def _indicator_tick() -> None:
+        try:
+            await _sync_support_state(
+                mark_read=(active_tab == "support"),
+                reason="indicator",
+            )
+        except Exception as indicator_error:
+            await _log(
+                f"[profile_menu][support][ОШИБКА индикатора] {indicator_error!r}",
+                type_msg="warning",
+            )
+
+    existing_indicator_timer = app.storage.client.get("support_indicator_timer")
+    if existing_indicator_timer is not None:
+        try:
+            existing_indicator_timer.cancel()
+        except Exception as timer_error:
+            await _log(
+                f"[profile_menu][support] не удалось остановить таймер индикатора: {timer_error!r}",
+                type_msg="warning",
+            )
+
+    if uid:
+        await _sync_support_state(mark_read=(active_tab == "support"), reason="initial")
+        indicator_timer = ui.timer(
+            SUPPORT_POLL_INTERVAL_SEC,
+            lambda: asyncio.create_task(_indicator_tick()),
+        )
+        app.storage.client["support_indicator_timer"] = indicator_timer
 
     session_token: str | None = app.storage.user.get("gmaps_session_token")
     if not session_token:
@@ -2029,11 +2175,496 @@ async def profile_menu(
                 raise
 
         async def _render_support(content: ui.element) -> None:
+            """Интерфейс чата техподдержки с отправкой сообщений и вложений."""
             try:
+                pending_files: list[dict[str, Any]] = []
+                send_in_progress: bool = False
+
+                chat_column: ui.column | None = None
+                scroll_area: ui.element | None = None
+                attachment_row: ui.row | None = None
+                attachment_label: ui.label | None = None
+                upload_ctrl: ui.upload | None = None
+                attach_button: ui.button | None = None
+                send_button: ui.button | None = None
+                input_field: ui.textarea | None = None
+                client_ctx = context.client
+
+                previous_timer = app.storage.client.get("support_chat_timer")
+                if previous_timer is not None:
+                    try:
+                        previous_timer.cancel()
+                    except Exception as stop_error:
+                        await _log(
+                            f"[profile_menu][support] не удалось остановить предыдущий таймер: {stop_error!r}",
+                            type_msg="warning",
+                        )
+
+                def _format_attachment_size(raw_value: Any) -> str:
+                    try:
+                        size = int(raw_value)
+                    except (TypeError, ValueError):
+                        return ""
+                    if size >= 1024 * 1024:
+                        return f"{size / (1024 * 1024):.1f} MB"
+                    if size >= 1024:
+                        return f"{size / 1024:.1f} KB"
+                    return f"{size} B"
+
+                def _format_ts(ts: str | None) -> str:
+                    dt_obj = _parse_support_ts_raw(ts)
+                    if dt_obj is None:
+                        return ""
+                    try:
+                        return dt_obj.astimezone().strftime("%d.%m %H:%M")
+                    except Exception:
+                        return dt_obj.strftime("%d.%m %H:%M")
+
+                async def _scroll_chat_to_bottom() -> None:
+                    """Жёстко прокручиваем чат вниз, повторяя попытки до появления контейнера."""
+                    if scroll_area is None:
+                        return
+                    # Комбинируем поиск по id и по классу + повторяем попытки, чтобы пережить переразметку
+                    target_id_literal = json.dumps(scroll_area.id)
+                    js = (
+                        "(() => {\n"
+                        f"  const TARGET_ID = {target_id_literal};\n"
+                        "  const resolvePair = () => {\n"
+                        "    let root = null;\n"
+                        "    if (TARGET_ID) {\n"
+                        "      if (typeof getHtmlElement === 'function') {\n"
+                        "        try { root = getHtmlElement(TARGET_ID); } catch (_err) { root = null; }\n"
+                        "      }\n"
+                        "      if (!root) {\n"
+                        "        root = document.getElementById(TARGET_ID) || null;\n"
+                        "      }\n"
+                        "    }\n"
+                        "    if (!root) {\n"
+                        "      root = document.querySelector('.profile-support-scroll');\n"
+                        "    }\n"
+                        "    if (!root) return null;\n"
+                        "    const container = root.querySelector('.q-scrollarea__container') || root;\n"
+                        "    const content = root.querySelector('.q-scrollarea__content') || container;\n"
+                        "    return { container, content };\n"
+                        "  };\n\n"
+                        "  const scrollOnce = () => {\n"
+                        "    const pair = resolvePair();\n"
+                        "    if (!pair) return false;\n"
+                        "    const container = pair.container;\n"
+                        "    const content = pair.content;\n"
+                        "    const maxScroll = Math.max(0, ((content.scrollHeight || container.scrollHeight || 0) - (container.clientHeight || 0)));\n"
+                        "    const targetTop = (content.scrollHeight || container.scrollHeight || 0) + 256;\n"
+                        "    if (typeof container.scrollTo === 'function') {\n"
+                        "      container.scrollTo({ top: targetTop, behavior: 'auto' });\n"
+                        "    } else {\n"
+                        "      container.scrollTop = targetTop;\n"
+                        "    }\n"
+                        "    const current = container.scrollTop || 0;\n"
+                        "    return current >= maxScroll - 2;\n"
+                        "  };\n\n"
+                        "  if (scrollOnce()) return;\n\n"
+                        "  let attempts = 24;\n"
+                        "  const scheduleNext = () => {\n"
+                        "    if (--attempts <= 0) return;\n"
+                        "    setTimeout(step, 40);\n"
+                        "  };\n"
+                        "  const step = () => {\n"
+                        "    if (scrollOnce()) return;\n"
+                        "    scheduleNext();\n"
+                        "  };\n"
+                        "  requestAnimationFrame(step);\n"
+                        "})();\n"
+                    )
+                    await _safe_js(js, timeout=1.5, target=scroll_area)
+
+                def _render_messages(thread: dict[str, Any]) -> None:
+                    if chat_column is None:
+                        return
+                    if client_ctx is None:
+                        return
+                    with client_ctx:
+                        chat_column.clear()
+                        items = thread.get("items") if isinstance(thread.get("items"), list) else []
+                        if not items:
+                            with chat_column:
+                                ui.label(lang_dict("profile_support_no_messages", current_lang)).classes(
+                                    "text-body2 text-grey-6"
+                                )
+                            return
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            author = "admin" if item.get("author") == "admin" else "user"
+                            text_value = (item.get("text") or "").strip()
+                            attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+                            ts_value = item.get("ts") if isinstance(item.get("ts"), str) else None
+                            align_class = "justify-start" if author == "user" else "justify-end"
+                            with chat_column:
+                                with ui.row().classes(f"w-full {align_class}"):
+                                    bubble = ui.element("div").classes("q-pa-sm rounded-borders").style(
+                                        "max-width:85%; white-space:pre-wrap; word-break:break-word;"
+                                    )
+                                    if author == "user":
+                                        bubble.classes("bg-grey-3 text-dark")
+                                    else:
+                                        bubble.classes("bg-primary text-white")
+                                    with bubble:
+                                        if text_value:
+                                            ui.label(text_value).classes("text-body2")
+                                        for attachment in attachments:
+                                            if not isinstance(attachment, dict):
+                                                continue
+                                            file_name = (
+                                                attachment.get("file_name")
+                                                or attachment.get("name")
+                                                or lang_dict("profile_support_upload_label", current_lang)
+                                            )
+                                            size_text = _format_attachment_size(attachment.get("file_size"))
+                                            with ui.row().classes("items-center gap-1"):
+                                                ui.icon("attach_file").props("size=16px")
+                                                ui.label(file_name).classes("text-caption")
+                                                if size_text:
+                                                    ui.label(size_text).classes("text-caption text-weight-light opacity-80")
+                                        ts_formatted = _format_ts(ts_value)
+                                        if ts_formatted:
+                                            with ui.row().classes("justify-end"):
+                                                ui.label(ts_formatted).classes("text-caption opacity-70")
+                        ui.timer(0.05, lambda: asyncio.create_task(_scroll_chat_to_bottom()), once=True)
+
+                def _update_attachment_row() -> None:
+                    if attachment_row is None or attachment_label is None:
+                        return
+                    if client_ctx is None:
+                        return
+                    with client_ctx:
+                        if not pending_files:
+                            attachment_row.visible = False
+                            attachment_label.text = ""
+                            return
+                        file_name = pending_files[0].get("name") or ""
+                        attachment_label.text = lang_dict(
+                            "profile_support_file_attached", current_lang, name=file_name
+                        )
+                        attachment_row.visible = True
+
+                async def _clear_attachment(_: Any | None = None) -> None:
+                    if not pending_files:
+                        return
+                    file_path = pending_files[0].get("path")
+                    pending_files.clear()
+                    _update_attachment_row()
+                    if file_path:
+                        try:
+                            Path(str(file_path)).unlink(missing_ok=True)
+                        except Exception as cleanup_error:
+                            await _log(
+                                f"[profile_menu][support] не удалось удалить временный файл: {cleanup_error!r}",
+                                type_msg="warning",
+                            )
+
+                async def _handle_upload(event: Any) -> None:
+                    if uid is None:
+                        ui.notify(lang_dict("profile_support_error", current_lang), type="negative")
+                        return
+                    try:
+                        saved_path = await _save_upload(uid, event, "support", lang=current_lang)
+                        file_path = Path(saved_path)
+                        file_name = file_path.name
+                        file_size = file_path.stat().st_size if file_path.exists() else None
+                        ext = file_path.suffix.lower()
+                        kind = "photo" if ext in {".jpg", ".jpeg", ".png", ".webp"} else "document"
+                        pending_files.clear()
+                        pending_files.append(
+                            {
+                                "path": saved_path,
+                                "name": file_name,
+                                "size": file_size,
+                                "ext": ext,
+                                "kind": kind,
+                            }
+                        )
+                        _update_attachment_row()
+                        ui.notify(
+                            lang_dict("profile_support_file_attached", current_lang, name=file_name),
+                            type="positive",
+                        )
+                        await _log(
+                            f"[profile_menu][support] файл {file_name} подготовлен к отправке",
+                            type_msg="info",
+                        )
+                    except ValueError as user_error:
+                        ui.notify(str(user_error), type="negative")
+                    except Exception as upload_error:
+                        await _log(
+                            f"[profile_menu][support][ОШИБКА загрузки] {upload_error!r}",
+                            type_msg="error",
+                        )
+                        ui.notify(lang_dict("profile_support_error", current_lang), type="negative")
+
+                async def _trigger_upload(_: Any | None = None) -> None:
+                    if upload_ctrl is None:
+                        return
+                    try:
+                        await upload_ctrl.run_method("pickFiles")
+                    except Exception:
+                        element_id = json.dumps(upload_ctrl.id)
+                        js = (
+                            "(() => {"
+                            "\n  const resolveRoot = (id) => {"
+                            "\n    if (!id) return null;"
+                            "\n    const viaDocument = document.getElementById(id);"
+                            "\n    if (viaDocument) return viaDocument;"
+                            "\n    if (typeof getHtmlElement === 'function') {"
+                            "\n      try { return getHtmlElement(id); } catch (_err) { return null; }"
+                            "\n    }"
+                            "\n    if (window?.getHtmlElement) {"
+                            "\n      try { return window.getHtmlElement(id); } catch (_err2) { return null; }"
+                            "\n    }"
+                            "\n    return null;"
+                            "\n  };"
+                            f"\n  const root = resolveRoot({element_id});"
+                            "\n  if (!root) return;"
+                            "\n  const input = root.querySelector('input[type=\"file\"]');"
+                            "\n  if (input && input !== document.activeElement) { input.click(); }"
+                            "\n})();"
+                        )
+                        await _safe_js(js, timeout=1.0, target=upload_ctrl)
+
+                def _compose_support_header(text_for_header: str | None) -> str:
+                    """Формируем заголовок для служебного чата с user_id."""
+                    role_raw = str(user.get("role") or "")
+                    role_prefix = "[Support/Driver]" if "driver" in role_raw.lower() else "[Support/Passenger]"
+                    username_value = user.get("username") or "None"
+                    if username_value not in (None, "", "None") and not str(username_value).startswith("@"):
+                        username_value = f"@{username_value}"
+                    first_name_value = user.get("first_name") or "None"
+                    header = (
+                        f"{role_prefix}\n"
+                        f"User: {uid}\n"
+                        f"Username: {username_value}\n"
+                        f"First_name: {first_name_value}"
+                    )
+                    if text_for_header:
+                        header = f"{header}\nText:\n{text_for_header}"
+                    return header
+
+                def _build_entry(
+                    text_payload: str,
+                    attachments_payload: list[dict[str, Any]],
+                    telegram_messages: list[Any],
+                ) -> dict[str, Any]:
+                    message_id = None
+                    if telegram_messages:
+                        message_id = getattr(telegram_messages[-1], "message_id", None)
+                    return {
+                        "id": uuid4().hex,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "author": "user",
+                        "text": text_payload,
+                        "attachments": attachments_payload,
+                        "meta": {
+                            "source": "web",
+                            "message_id": message_id,
+                        },
+                    }
+
+                async def _send_message(_: Any | None = None) -> None:
+                    nonlocal send_in_progress
+                    if send_in_progress:
+                        return
+                    if uid is None:
+                        ui.notify(lang_dict("profile_support_error", current_lang), type="negative")
+                        return
+
+                    text_payload = (input_field.value or "").strip() if input_field else ""
+                    if not text_payload and not pending_files:
+                        ui.notify(lang_dict("profile_support_validation_empty", current_lang), type="warning")
+                        return
+
+                    send_in_progress = True
+                    if send_button is not None:
+                        send_button.disable()
+
+                    try:
+                        telegram_response = None
+                        header_payload = _compose_support_header(text_payload if text_payload else None)
+                        if pending_files:
+                            file_info = pending_files[0]
+                            caption = header_payload
+                            if file_info.get("kind") == "photo":
+                                telegram_response = await send_info_msg(
+                                    photo=file_info["path"],
+                                    caption=caption,
+                                    type_msg_tg="support",
+                                )
+                            else:
+                                telegram_response = await send_info_msg(
+                                    document=file_info["path"],
+                                    caption=caption,
+                                    type_msg_tg="support",
+                                )
+                        else:
+                            telegram_response = await send_info_msg(
+                                text=header_payload,
+                                type_msg_tg="support",
+                            )
+
+                        if telegram_response is None:
+                            ui.notify(lang_dict("profile_support_error", current_lang), type="negative")
+                            await _log(
+                                "[profile_menu][support] send_info_msg вернул None",
+                                type_msg="error",
+                            )
+                            return
+
+                        attachments_payload: list[dict[str, Any]] = []
+                        if pending_files:
+                            file_info = pending_files[0]
+                            attachments_payload.append(
+                                {
+                                    "kind": file_info.get("kind"),
+                                    "file_path": file_info.get("path"),
+                                    "file_name": file_info.get("name"),
+                                    "file_size": file_info.get("size"),
+                                    "ext": file_info.get("ext"),
+                                }
+                            )
+
+                        telegram_messages = (
+                            telegram_response if isinstance(telegram_response, list) else [telegram_response]
+                        )
+
+                        for idx, tg_msg in enumerate(telegram_messages):
+                            target_idx = min(idx, len(attachments_payload) - 1) if attachments_payload else None
+                            if target_idx is None:
+                                continue
+                            doc_obj = getattr(tg_msg, "document", None)
+                            if doc_obj is not None:
+                                attachments_payload[target_idx].update(
+                                    {
+                                        "file_id": doc_obj.file_id,
+                                        "file_unique_id": doc_obj.file_unique_id,
+                                        "mime_type": doc_obj.mime_type,
+                                    }
+                                )
+                            photo_set = getattr(tg_msg, "photo", None) or []
+                            if photo_set:
+                                photo_obj = photo_set[-1]
+                                attachments_payload[target_idx].update(
+                                    {
+                                        "file_id": photo_obj.file_id,
+                                        "file_unique_id": photo_obj.file_unique_id,
+                                        "width": photo_obj.width,
+                                        "height": photo_obj.height,
+                                    }
+                                )
+
+                        entry = _build_entry(text_payload, attachments_payload, telegram_messages)
+                        await append_support_message(uid, entry, author="user")
+
+                        await _sync_support_state(
+                            mark_read=True,
+                            reason="web-send",
+                            on_update=_render_messages,
+                        )
+
+                        pending_files.clear()
+                        _update_attachment_row()
+                        if input_field is not None:
+                            input_field.value = ""
+
+                        ui.notify(lang_dict("profile_support_success", current_lang), type="positive")
+                        await _scroll_chat_to_bottom()
+                        await _log(
+                            "[profile_menu][support] сообщение из веб-интерфейса доставлено",
+                            type_msg="info",
+                        )
+                    except Exception as send_error:
+                        await _log(
+                            f"[profile_menu][support][ОШИБКА отправки] {send_error!r}",
+                            type_msg="error",
+                        )
+                        ui.notify(lang_dict("profile_support_error", current_lang), type="negative")
+                    finally:
+                        send_in_progress = False
+                        if send_button is not None:
+                            send_button.enable()
+
                 with content:
-                    with ui.card().classes('w-full q-pa-md gap-2'):
-                        ui.label(lang_dict('profile_support_hint', current_lang)).classes('text-body2')
-                        ui.button(lang_dict('profile_support_contact', current_lang)).props('color=primary unelevated')
+                    with ui.card().classes(
+                        "profile-support-card w-full q-pa-md gap-3 flex flex-col flex-1"
+                    ).style("min-height:0;"):
+                        ui.label(lang_dict("profile_support_hint", current_lang)).classes("text-body2")
+
+                        scroll_area = ui.scroll_area().classes(
+                            "profile-support-scroll w-full flex-1"
+                        ).style("max-height:none; min-height:0;")
+                        with scroll_area:
+                            chat_column = ui.column().classes("w-full q-gutter-sm")
+
+                        attachment_row = ui.row().classes("w-full items-center gap-2")
+                        attachment_row.visible = False
+                        with attachment_row:
+                            attachment_label = ui.label("").classes("text-caption")
+                            ui.button(icon="close", on_click=_clear_attachment).props(
+                                "flat round dense color=negative"
+                            )
+
+                    with ui.element("div").classes("profile-support-input-wrapper w-full mt-auto"):
+                        with ui.row().classes("profile-support-input-row w-full items-end gap-2"):
+                            input_field = ui.textarea().props(
+                                "outlined autogrow min-rows=1 max-rows=4 clearable"
+                            ).classes("flex-1")
+                            input_field.props(
+                                f'placeholder="{lang_dict("profile_support_input_placeholder", current_lang)}"'
+                            )
+
+                            upload_ctrl = ui.upload().props(
+                                'accept=".jpg,.jpeg,.png,.webp,.pdf" auto-upload max-files=1'
+                            ).classes("hidden")
+                            upload_ctrl.on_upload(_handle_upload)
+
+                            attach_button = ui.button(
+                                icon="attach_file",
+                                on_click=_trigger_upload,
+                            ).props("round flat color=primary")
+
+                            send_button = ui.button(
+                                icon="send",
+                                on_click=_send_message,
+                            ).props("round unelevated color=primary")
+
+                _render_messages(support_thread_cache)
+                _update_attachment_row()
+
+                if uid is None:
+                    if input_field is not None:
+                        input_field.disable()
+                    if attach_button is not None:
+                        attach_button.disable()
+                    if send_button is not None:
+                        send_button.disable()
+                else:
+                    await _sync_support_state(
+                        mark_read=True,
+                        reason="support-open",
+                        on_update=_render_messages,
+                    )
+                    await _scroll_chat_to_bottom()
+
+                    async def _refresh_chat_loop() -> None:
+                        await _sync_support_state(
+                            mark_read=True,
+                            reason="support-loop",
+                            on_update=_render_messages,
+                        )
+
+                    chat_timer = ui.timer(
+                        SUPPORT_POLL_INTERVAL_SEC,
+                        lambda: asyncio.create_task(_refresh_chat_loop()),
+                    )
+                    app.storage.client["support_chat_timer"] = chat_timer
+
             except Exception as e:
                 await _log(f'[profile_menu][support][ОШИБКА] {e!r}', type_msg='error')
                 raise
@@ -2056,7 +2687,9 @@ async def profile_menu(
                     section, "profile_personal_title"
                 )
                 with root:
-                    with ui.column().classes("w-full q-mt-md"):
+                    with ui.column().classes("w-full q-mt-md flex-1").style(
+                        "display:flex; flex-direction:column; min-height:0;"
+                    ):
                         with ui.row().classes("w-full items-center").style('position: relative;'):
                             ui.button(
                                 icon="arrow_back",
@@ -2065,7 +2698,11 @@ async def profile_menu(
                             ui.label(
                                 lang_dict(title_key, current_lang),
                             ).classes("text-h6 text-center").style('position:absolute; left:50%; transform:translateX(-50%);')
-                    content = ui.column().classes('w-full q-gutter-y-sm').style('max-height:100%;')
+                        content = (
+                            ui.column()
+                            .classes('w-full flex-1 q-gutter-y-sm')
+                            .style('display:flex; flex-direction:column; min-height:0;')
+                        )
 
                     renderer = SECTION_RENDERERS.get(section)
                     if renderer is not None:
@@ -2876,6 +3513,13 @@ async def profile_menu(
                             ui.label(lang_dict(text_key, user_lang)).classes(
                                 "text-body1"
                             )
+                            if icon_name == "support_agent":
+                                ui.icon("fiber_manual_record").props("size=10px color=negative").classes(
+                                    "q-ml-xs"
+                                ).bind_visibility_from(
+                                    app.storage.user,
+                                    "support_has_unread",
+                                )
                         ui.element("div").classes("flex-1")
                         if icon_name not in without_chevron:
                             ui.icon("chevron_right").props("size=24px")

@@ -384,27 +384,127 @@ async def main_app():
         try:
             await ui.run_javascript(
                 """
-                (function(){
-                  const doc = document.documentElement;
-                  const flagKey = '__main_app_vh_bound';
-                  if (doc[flagKey]) { return true; }
-                  const telegram = window.Telegram?.WebApp;
+                                (function(){
+                                    try {
+                                        const doc = document.documentElement;
+                                        const flagKey = '__main_app_vh_bound';
+                                        if (doc[flagKey]) { return true; }
+                                        const telegram = window.Telegram?.WebApp;
 
-                  const updateViewport = () => {
-                    const viewport = telegram?.viewportStableHeight || window.innerHeight;
-                    doc.style.setProperty('--main-app-viewport', `${viewport}px`);
-                    const footer = document.querySelector('.app-footer');
-                    if (!footer) { return; }
-                    const footerHeight = footer.getBoundingClientRect().height;
-                    doc.style.setProperty('--main-footer-height', `${footerHeight}px`);
-                  };
+                                        // Управляем видимостью футера при открытии экранной клавиатуры
+                                        const state = {
+                                            footerHeight: 0,
+                                            footerHidden: false,
+                                            keyboardActive: false,
+                                            viewportKeyboard: false,
+                                            restoreTimer: null,
+                                        };
 
-                  updateViewport();
-                  window.addEventListener('resize', updateViewport);
-                  telegram?.onEvent?.('viewportChanged', updateViewport);
-                  doc[flagKey] = true;
-                  return true;
-                })();
+                                        // Список типов input, которые раскрывают клавиатуру
+                                        const textInputTypes = new Set([
+                                            'text', 'search', 'email', 'password', 'tel', 'url', 'number',
+                                            'datetime-local', 'date', 'time', 'month', 'week'
+                                        ]);
+
+                                        const getFooter = () => document.querySelector('.app-footer');
+
+                                        const applyFooterHeight = (value) => {
+                                            state.footerHeight = value;
+                                            doc.style.setProperty('--main-footer-height', `${value}px`);
+                                        };
+
+                                        const hideFooter = () => {
+                                            if (state.footerHidden) { return; }
+                                            const footer = getFooter();
+                                            if (!footer) { return; }
+                                            const rect = footer.getBoundingClientRect();
+                                            if (rect.height > 0) {
+                                                state.footerHeight = rect.height;
+                                            }
+                                            footer.classList.add('app-footer--hidden');
+                                            doc.style.setProperty('--main-footer-height', '0px');
+                                            state.footerHidden = true;
+                                        };
+
+                                        const showFooter = () => {
+                                            if (!state.footerHidden) { return; }
+                                            const footer = getFooter();
+                                            if (!footer) { return; }
+                                            footer.classList.remove('app-footer--hidden');
+                                            doc.style.setProperty('--main-footer-height', `${state.footerHeight}px`);
+                                            state.footerHidden = false;
+                                        };
+
+                                        const isEditable = (element) => {
+                                            if (!element) { return false; }
+                                            if (element.isContentEditable) { return true; }
+                                            const tag = element.tagName?.toLowerCase();
+                                            if (tag === 'textarea') { return true; }
+                                            if (tag !== 'input') { return false; }
+                                            const type = element.type?.toLowerCase() || 'text';
+                                            return textInputTypes.has(type);
+                                        };
+
+                                        // Пересчитываем высоты и определяем состояние клавиатуры
+                                        const KEYBOARD_THRESHOLD = 40;
+
+                                        const updateViewport = () => {
+                                            const currentHeight = telegram?.viewportHeight || window.innerHeight;
+                                            const stableHeight = telegram?.viewportStableHeight || currentHeight;
+                                            const heightGap = Math.max(0, stableHeight - currentHeight);
+                                            const keyboardLikely = heightGap > KEYBOARD_THRESHOLD;
+                                            state.viewportKeyboard = keyboardLikely;
+                                            const baseHeight = keyboardLikely ? currentHeight : stableHeight;
+                                            const effectiveGap = keyboardLikely ? Math.max(0, Math.round(heightGap)) : 0;
+                                            doc.style.setProperty('--main-app-viewport', `${baseHeight}px`);
+                                            doc.style.setProperty('--keyboard-gap', `${effectiveGap}px`);
+                                            const footer = getFooter();
+                                            if (footer && !state.footerHidden) {
+                                                applyFooterHeight(footer.getBoundingClientRect().height);
+                                            }
+                                            if (keyboardLikely) {
+                                                hideFooter();
+                                            } else if (!state.keyboardActive) {
+                                                showFooter();
+                                            }
+                                        };
+
+                                        const scheduleRestore = () => {
+                                            if (state.restoreTimer) {
+                                                window.clearTimeout(state.restoreTimer);
+                                            }
+                                            state.restoreTimer = window.setTimeout(() => {
+                                                if (!state.keyboardActive && !state.viewportKeyboard) {
+                                                    showFooter();
+                                                }
+                                            }, 180);
+                                        };
+
+                                        document.addEventListener('focusin', (event) => {
+                                            if (isEditable(event.target)) {
+                                                state.keyboardActive = true;
+                                                hideFooter();
+                                            }
+                                        }, true);
+
+                                        document.addEventListener('focusout', (event) => {
+                                            if (isEditable(event.target)) {
+                                                state.keyboardActive = false;
+                                                scheduleRestore();
+                                            }
+                                        }, true);
+
+                                        window.addEventListener('resize', updateViewport);
+                                        telegram?.onEvent?.('viewportChanged', updateViewport);
+
+                                        doc[flagKey] = true;
+                                        updateViewport();
+                                        return true;
+                                    } catch (bindError) {
+                                        console.warn('viewport/keyboard binding failed', bindError);
+                                        return false;
+                                    }
+                                })();
                 """,
                 timeout=3.0,
             )

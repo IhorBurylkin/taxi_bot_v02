@@ -133,13 +133,14 @@ def _ensure_theme_assets_once() -> None:
     --page-bg: #ffffff;
     --field-bg: transparent;
     --field-bg-disabled: transparent;
-    --fg: #111827; 
-    --fg-muted: #374151; 
-    --bg-card: #fff; 
+    --fg: #111827;
+    --fg-muted: #374151;
+    --bg-card: #fff;
     --border: #e5e7eb;
-    --underline: transparent; 
-    --underline-focus: #3b82f6; 
+    --underline: transparent;
+    --underline-focus: #3b82f6;
     --menu-bg: #fff;
+    --keyboard-gap: 0px;
   }
   
   /* Токены темной темы */
@@ -264,6 +265,14 @@ def _ensure_theme_assets_once() -> None:
     backdrop-filter: none !important;
   }
 
+  /* Футер в скрытом состоянии (клавиатура активна) */
+  .app-footer.app-footer--hidden {
+    transform: translateY(100%);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform .2s ease, opacity .2s ease;
+  }
+
   /* Главная страница: контейнер вкладок с ограничением по высоте */
   .main-app-content {
     flex: 1 1 auto;
@@ -305,6 +314,40 @@ def _ensure_theme_assets_once() -> None:
 
   body.body--dark .profile-menu-item {
     border-bottom: 1px solid rgba(255,255,255,.08);
+  }
+
+  /* Поддержка: растягиваем карточку и прикрепляем панель ввода над футером */
+  .profile-support-card {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .profile-support-scroll {
+    flex: 1 1 auto;
+    max-height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 64px));
+    overflow-y: auto;
+  }
+
+  .profile-support-input-wrapper {
+    position: sticky;
+    /* bottom: calc(var(--main-footer-height, 64px) + env(safe-area-inset-bottom, 0px) + 12px); */
+    background: linear-gradient(to top, var(--bg-card) 80%, rgba(0,0,0,0));
+    padding-top: 12px;
+    padding-bottom: var(--keyboard-gap, 0px);
+    z-index: 5;
+  }
+
+  .profile-support-input-row {
+    background: var(--bg-card);
+    border-radius: 12px;
+    box-shadow: 0 -2px 12px rgba(0,0,0,.06);
+    padding: 8px 12px;
+  }
+
+  body.body--dark .profile-support-input-row {
+    box-shadow: 0 -2px 12px rgba(0,0,0,.32);
   }
 </style>
 ''')

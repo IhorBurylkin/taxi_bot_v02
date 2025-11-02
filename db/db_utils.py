@@ -1,9 +1,8 @@
 from db.db_table_init import get_connection, release_connection
 from log.log import log_info
-from typing import Optional, Dict, List, Union, Tuple
+from typing import Optional, Dict, List, Union, Tuple, Any, Iterable, Literal
 import json
-from typing import Iterable
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timezone
 from decimal import Decimal
 from enum import Enum
 from config.config import get_settings
@@ -22,6 +21,230 @@ def _jsonable(obj):
     if isinstance(obj, (list, tuple, set)):
         return [_jsonable(v) for v in obj]
     return str(obj)
+
+# Формат JSON-колонки support_requests.messages:
+# {
+#   "items": [
+#     {
+#       "id": "uuid",
+#       "ts": "ISO8601",
+#       "author": "user" | "admin",
+#       "text": "...",
+#       "attachments": [{"kind": "document" | "photo", ...}],
+#       "meta": {"source": "telegram|web|admin_chat", ...}
+#     },
+#     ...
+#   ],
+#   "cursors": {"user_last_read": "ISO8601" | null, "admin_last_read": "ISO8601" | null},
+#   "meta": {"updated_at": "ISO8601", "last_author": "user|admin"}
+# }
+# Такая структура облегчает сортировку по временной метке и вычисление непрочитанных сообщений.
+
+
+def _normalize_support_thread(raw: Any) -> Dict[str, Any]:
+    """Возвращает корректный словарь диалога, даже если в БД лежат повреждённые данные."""
+    thread: Dict[str, Any] = {"items": [], "cursors": {}, "meta": {}}
+
+    # Преобразуем строковое JSON-представление, если колонка хранится как TEXT
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return thread
+
+    if isinstance(raw, dict):
+        items = raw.get("items")
+        if isinstance(items, list):
+            thread["items"] = [item for item in items if isinstance(item, dict)]
+        cursors = raw.get("cursors")
+        if isinstance(cursors, dict):
+            thread["cursors"] = {
+                "user_last_read": cursors.get("user_last_read"),
+                "admin_last_read": cursors.get("admin_last_read"),
+            }
+        meta = raw.get("meta")
+        if isinstance(meta, dict):
+            thread["meta"] = meta
+    return thread
+
+
+def _parse_support_ts(value: Any) -> datetime | None:
+    """Безопасно парсит timestamp из ISO-строки."""
+    if not value or not isinstance(value, str):
+        return None
+    normalized = value
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _latest_timestamp(items: List[Dict[str, Any]], *, author: str | None = None) -> str | None:
+    """Возвращает ISO8601 последнего сообщения (опц. по автору)."""
+    candidates: List[str] = []
+    for item in items:
+        if author is not None and item.get("author") != author:
+            continue
+        ts = item.get("ts")
+        if isinstance(ts, str):
+            candidates.append(ts)
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=lambda x: _parse_support_ts(x) or datetime.min.replace(tzinfo=timezone.utc))
+    except Exception:
+        return max(candidates)
+
+
+def _sorted_support_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Возвращает список сообщений, отсортированный по временной метке."""
+    return sorted(
+        items,
+        key=lambda item: _parse_support_ts(item.get("ts")) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+
+
+async def _save_support_thread(connection, user_id: int, thread: Dict[str, Any]) -> None:
+    """Сохраняет JSON-структуру диалога в таблицу support_requests."""
+    payload = json.dumps(thread, ensure_ascii=False)
+    await connection.execute(
+        (
+            'INSERT INTO "support_requests" (user_id, messages) VALUES ($1, $2::jsonb) '
+            'ON CONFLICT (user_id) DO UPDATE SET messages = EXCLUDED.messages;'
+        ),
+        user_id,
+        payload,
+    )
+
+
+async def get_support_thread(user_id: int) -> Dict[str, Any]:
+    """Возвращает историю обращений пользователя в техподдержку."""
+    connection = None
+    try:
+        connection = await get_connection()
+        row = await connection.fetchrow('SELECT messages FROM "support_requests" WHERE user_id = $1;', user_id)
+        payload = dict(row).get("messages") if row else None
+        thread = _normalize_support_thread(payload)
+        thread["items"] = _sorted_support_items(thread.get("items", []))
+        return thread
+    except Exception as error:
+        await log_info(
+            f"get_support_thread: ошибка чтения диалога → {error}",
+            type_msg="error",
+            user_id=user_id,
+        )
+        return {"items": [], "cursors": {}, "meta": {}}
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def append_support_message(
+    user_id: int,
+    entry: Dict[str, Any],
+    *,
+    author: Literal["user", "admin"],
+) -> Dict[str, Any] | None:
+    """Добавляет сообщение в историю техподдержки с учётом блокировок."""
+    connection = None
+    try:
+        connection = await get_connection()
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                'SELECT messages FROM "support_requests" WHERE user_id = $1 FOR UPDATE;',
+                user_id,
+            )
+            payload = dict(row).get("messages") if row else None
+            thread = _normalize_support_thread(payload)
+            items: List[Dict[str, Any]] = thread.get("items", [])
+
+            safe_entry = dict(entry or {})
+            safe_entry.setdefault("author", author)
+            if not safe_entry.get("ts"):
+                safe_entry["ts"] = datetime.now(timezone.utc).isoformat()
+
+            items.append(safe_entry)
+            thread["items"] = _sorted_support_items(items)
+
+            cursors = thread.setdefault("cursors", {})
+            cursors_key = "user_last_read" if author == "user" else "admin_last_read"
+            cursors[cursors_key] = safe_entry.get("ts")
+
+            meta = thread.setdefault("meta", {})
+            meta["updated_at"] = safe_entry.get("ts")
+            meta["last_author"] = author
+
+            await _save_support_thread(connection, user_id, thread)
+
+        await log_info(
+            "append_support_message: сообщение сохранено", type_msg="info", user_id=user_id
+        )
+        return thread
+    except Exception as error:
+        await log_info(
+            f"append_support_message: ошибка записи сообщения → {error}",
+            type_msg="error",
+            user_id=user_id,
+        )
+        return None
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def mark_support_thread_read(
+    user_id: int,
+    role: Literal["user", "admin"],
+    ts: str | None = None,
+) -> bool:
+    """Обновляет курсор прочитанных сообщений для пользователя или администратора."""
+    connection = None
+    try:
+        connection = await get_connection()
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                'SELECT messages FROM "support_requests" WHERE user_id = $1 FOR UPDATE;',
+                user_id,
+            )
+            payload = dict(row).get("messages") if row else None
+            if payload is None:
+                return False
+
+            thread = _normalize_support_thread(payload)
+            items = _sorted_support_items(thread.get("items", []))
+            thread["items"] = items
+
+            cursor_key = "user_last_read" if role == "user" else "admin_last_read"
+            target_ts = ts or _latest_timestamp(items)
+            if not target_ts:
+                return False
+
+            prev_dt = _parse_support_ts(thread.get("cursors", {}).get(cursor_key))
+            next_dt = _parse_support_ts(target_ts)
+            if prev_dt and next_dt and next_dt <= prev_dt:
+                return True
+
+            thread.setdefault("cursors", {})[cursor_key] = target_ts
+            thread.setdefault("meta", {})["last_read_role"] = role
+
+            await _save_support_thread(connection, user_id, thread)
+
+        await log_info(
+            f"mark_support_thread_read: курсор для {role} обновлён", type_msg="info", user_id=user_id
+        )
+        return True
+    except Exception as error:
+        await log_info(
+            f"mark_support_thread_read: ошибка обновления курсора → {error}",
+            type_msg="error",
+            user_id=user_id,
+        )
+        return False
+    finally:
+        if connection:
+            await release_connection(connection)
 
 async def user_exists(user_id: int) -> bool:
     """
