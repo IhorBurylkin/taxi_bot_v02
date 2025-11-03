@@ -295,8 +295,8 @@ async def main_app():
 
                 # Панель: Главная
                 with ui.tab_panel('main').classes('w-full q-pa-none q-ma-none flex flex-col'):
-                    #await render_main_map(uid, user_lang, user_data)
-                    print("DEBUG: main_app - render_main_map called")
+                    # Отрисовываем карту с учётом языка и данных пользователя
+                    await render_main_map(uid, user_lang, user_data)
 
                 # Панель: Поездки
                 with ui.tab_panel('trips'):

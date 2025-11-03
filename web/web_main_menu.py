@@ -13,7 +13,12 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 from nicegui import app, ui
 from yarl import URL
 
-from config.config import GMAPS_API_KEY, GMAPS_URL_SIGNING_SECRET, USERS_TABLE
+from config.config import (
+	GMAPS_API_KEY,
+	GMAPS_CLIENT_ID,
+	GMAPS_URL_SIGNING_SECRET,
+	USERS_TABLE,
+)
 from config.config_utils import lang_dict
 from db.db_utils import get_user_data
 from log.log import log_info
@@ -31,6 +36,8 @@ FALLBACK_LOGGED_KEY = "main_map_fallback_logged"
 FALLBACK_FAILED_LOGGED_KEY = "main_map_fallback_failed_logged"
 FALLBACK_NOTIFIED_KEY = "main_map_fallback_notified"
 FALLBACK_FAILED_NOTIFIED_KEY = "main_map_fallback_failed_notified"
+CENTER_BUTTON_STYLE_KEY = "main_map_center_button_style_added"
+USER_CLIENT_CACHE_KEY = "main_map_gmaps_client_id"
 
 MAP_INIT_TIMEOUT_SEC = 12.0
 GEO_PERMISSION_TIMEOUT_SEC = 3.0
@@ -40,6 +47,27 @@ DEFAULT_INITIAL_ZOOM = 16
 DEFAULT_FALLBACK_ZOOM = 12
 
 USERS_TABLE_NAME = USERS_TABLE or "users"
+SIGNATURE_DISABLED_LOGGED = False
+
+# Стили для тёмной темы Google Maps.
+DARK_GOOGLE_MAP_STYLE: list[dict[str, Any]] = [
+	{"elementType": "geometry", "stylers": [{"color": "#1f1f1f"}]},
+	{"elementType": "labels.text.fill", "stylers": [{"color": "#e0e0e0"}]},
+	{"elementType": "labels.text.stroke", "stylers": [{"color": "#1f1f1f"}]},
+	{"featureType": "administrative", "elementType": "geometry", "stylers": [{"color": "#3a3a3a"}]},
+	{"featureType": "poi", "elementType": "geometry", "stylers": [{"color": "#2a2a2a"}]},
+	{"featureType": "poi", "elementType": "labels.text.fill", "stylers": [{"color": "#cfcfcf"}]},
+	{"featureType": "poi.park", "elementType": "geometry", "stylers": [{"color": "#223322"}]},
+	{"featureType": "poi.park", "elementType": "labels.text.fill", "stylers": [{"color": "#99cc99"}]},
+	{"featureType": "road", "elementType": "geometry", "stylers": [{"color": "#2e2e2e"}]},
+	{"featureType": "road", "elementType": "geometry.stroke", "stylers": [{"color": "#1b1b1b"}]},
+	{"featureType": "road", "elementType": "labels.text.fill", "stylers": [{"color": "#bbbbbb"}]},
+	{"featureType": "road.highway", "elementType": "geometry", "stylers": [{"color": "#3c3c3c"}]},
+	{"featureType": "road.highway", "elementType": "geometry.stroke", "stylers": [{"color": "#282828"}]},
+	{"featureType": "transit", "elementType": "geometry", "stylers": [{"color": "#2b2b2b"}]},
+	{"featureType": "water", "elementType": "geometry", "stylers": [{"color": "#16202a"}]},
+	{"featureType": "water", "elementType": "labels.text.fill", "stylers": [{"color": "#4f85c4"}]},
+]
 
 
 class FallbackLocation(TypedDict):
@@ -48,12 +76,30 @@ class FallbackLocation(TypedDict):
 	address: str
 
 
+
 def _set_client_value(key: str, value: Any) -> None:
 	app.storage.client[key] = value
 
 
 def _get_client_value(key: str, default: Any = None) -> Any:
 	return app.storage.client.get(key, default)
+
+
+def _set_user_value(key: str, value: Any) -> None:
+	app.storage.user[key] = value
+
+
+def _get_user_value(key: str, default: Any = None) -> Any:
+	return app.storage.user.get(key, default)
+
+
+def _get_configured_client_id() -> str | None:
+	env_value = os.getenv("GMAPS_CLIENT_ID")
+	if env_value:
+		return env_value.strip()
+	if GMAPS_CLIENT_ID:
+		return str(GMAPS_CLIENT_ID).strip()
+	return None
 
 
 def _get_api_key() -> str | None:
@@ -71,14 +117,39 @@ async def _append_signature(
 	if not GMAPS_URL_SIGNING_SECRET:
 		return params
 
+	client_id_value: str | None
+	configured_id = _get_configured_client_id()
+	if configured_id:
+		client_id_value = configured_id
+	else:
+		stored_user = _get_user_value(USER_CLIENT_CACHE_KEY)
+		stored_client = _get_client_value(USER_CLIENT_CACHE_KEY)
+		candidate = stored_user or stored_client
+		client_id_value = str(candidate) if candidate else None
+
+	if not client_id_value:
+		global SIGNATURE_DISABLED_LOGGED
+		if not SIGNATURE_DISABLED_LOGGED:
+			SIGNATURE_DISABLED_LOGGED = True
+			await log_info(
+				"[main_map] подпись запросов отключена: отсутствует client id",
+				type_msg="warning",
+				uid=uid,
+			)
+		return params
+
+	_set_client_value(USER_CLIENT_CACHE_KEY, client_id_value)
+
 	try:
 		padded = GMAPS_URL_SIGNING_SECRET + "=" * (-len(GMAPS_URL_SIGNING_SECRET) % 4)
 		key = base64.urlsafe_b64decode(padded.encode("utf-8"))
-		url = URL.build(scheme="https", host=GMAPS_HOST, path=path, query=params)
+		client_params = [(k, v) for k, v in params if k != "client"]
+		client_params.append(("client", client_id_value))
+		url = URL.build(scheme="https", host=GMAPS_HOST, path=path, query=client_params)
 		resource = url.raw_path.encode("utf-8")
 		digest = hmac.new(key, resource, hashlib.sha1).digest()
 		signature = base64.urlsafe_b64encode(digest).decode("utf-8")
-		return [*params, ("signature", signature)]
+		return [*client_params, ("signature", signature)]
 	except Exception as sign_error:  # noqa: BLE001
 		await log_info(
 			"[main_map] не удалось подписать запрос Google Maps",
@@ -87,6 +158,73 @@ async def _append_signature(
 			reason=str(sign_error),
 		)
 		return params
+
+
+def _extract_client_id(source: dict[str, Any] | None) -> str | None:
+	"""Извлекаем client id из записи пользователя."""
+	if not isinstance(source, dict):
+		return None
+	for field in ("gmaps_client_id", "client_id", "google_client_id"):
+		value = source.get(field)
+		if isinstance(value, (str, int)) and str(value).strip():
+			return str(value).strip()
+	return None
+
+
+async def _ensure_gmaps_client_id(uid: int | None, user_data: dict | None) -> str | None:
+	"""Гарантируем наличие client id в storage для подписи запросов."""
+	try:
+		if stored := _get_user_value(USER_CLIENT_CACHE_KEY):
+			return str(stored)
+
+		configured_id = _get_configured_client_id()
+		if configured_id:
+			client_value = configured_id
+			_set_user_value(USER_CLIENT_CACHE_KEY, client_value)
+			_set_client_value(USER_CLIENT_CACHE_KEY, client_value)
+			return client_value
+
+		candidate = _extract_client_id(user_data)
+
+		resolved_user: dict[str, Any] | None = None
+		if candidate is None and uid is not None:
+			try:
+				resolved_user = await get_user_data(USERS_TABLE_NAME, uid)
+			except Exception as db_error:  # noqa: BLE001
+				await log_info(
+					"[main_map] не удалось прочитать client id из БД",
+					type_msg="warning",
+					uid=uid,
+					reason=str(db_error),
+				)
+			else:
+				candidate = _extract_client_id(resolved_user)
+
+		if candidate:
+			_set_user_value(USER_CLIENT_CACHE_KEY, candidate)
+			_set_client_value(USER_CLIENT_CACHE_KEY, candidate)
+			await log_info(
+				"[main_map] client id сохранён в storage",
+				type_msg="info",
+				uid=uid,
+			)
+			return candidate
+
+		await log_info(
+			"[main_map] client id недоступен в профиле",
+			type_msg="warning",
+			uid=uid,
+			user_keys=sorted((user_data or {}).keys()),
+			resolved_keys=sorted((resolved_user or {}).keys()) if resolved_user else None,
+		)
+	except Exception as ensure_error:  # noqa: BLE001
+		await log_info(
+			"[main_map] ошибка подготовки client id",
+			type_msg="error",
+			uid=uid,
+			reason=str(ensure_error),
+		)
+	return None
 
 
 async def _log_fallback_usage(
@@ -178,7 +316,29 @@ async def _resolve_fallback_coordinates(
 			async with session.get(
 				f"https://{GMAPS_HOST}{GEOCODE_PATH}", params=signed_params
 			) as response:
-				payload: dict[str, Any] = await response.json(content_type=None)
+				if response.status != 200:
+					try:
+						body_text = await response.text()
+					except Exception as body_error:  # noqa: BLE001
+						body_text = f"<не удалось прочитать тело: {body_error}>"
+					await log_info(
+						"[main_map] геокодер вернул код ответа",
+						type_msg="warning",
+						uid=uid,
+						status_code=response.status,
+						response_body=body_text[:1000],
+					)
+					return None
+				try:
+					payload: dict[str, Any] = await response.json(content_type=None)
+				except Exception as decode_error:  # noqa: BLE001
+					await log_info(
+						"[main_map] геокодер вернул не-JSON",
+						type_msg="warning",
+						uid=uid,
+						reason=str(decode_error),
+					)
+					return None
 	except ClientError as http_error:
 		await log_info(
 			"[main_map] ошибка HTTP при запросе геокодера",
@@ -208,6 +368,14 @@ async def _resolve_fallback_coordinates(
 		return None
 
 	results = payload.get("results") or []
+	error_message = payload.get("error_message")
+	if error_message:
+		await log_info(
+			"[main_map] геокодер вернул сообщение об ошибке",
+			type_msg="warning",
+			uid=uid,
+			error_message=str(error_message),
+		)
 	if not results:
 		await log_info(
 			"[main_map] геокодер не нашёл координаты",
@@ -344,6 +512,97 @@ async def _ensure_geo_error_handler() -> None:
 	_set_client_value(HANDLER_FLAG_KEY, True)
 
 
+# Обеспечивает единоразовую загрузку скрипта Google Maps на клиенте.
+async def _ensure_gmaps_script(
+	api_key: str,
+	safe_lang: str,
+	uid: int | None,
+) -> bool:
+	if _get_client_value(SCRIPT_FLAG_KEY):
+		return True
+
+	language_param = safe_lang.lower()
+	script_url = (
+		f"https://{GMAPS_HOST}/maps/api/js?key={api_key}&v=weekly"
+		f"&libraries=geometry&loading=async&language={language_param}"
+	)
+
+	js_code = f"""
+	(async () => {{
+		const url = {json.dumps(script_url)};
+		const selector = 'script[data-taxibot-gmaps="1"]';
+		if (window.google?.maps) {{
+			return {{ status: 'ok' }};
+		}}
+		let script = document.head.querySelector(selector);
+		if (!script) {{
+			script = document.createElement('script');
+			script.src = url;
+			script.async = true;
+			script.defer = true;
+			script.setAttribute('data-taxibot-gmaps', '1');
+			document.head.appendChild(script);
+		}} else if (!script.src.includes(url)) {{
+			script.src = url;
+		}}
+		return await Promise.race([
+			new Promise((resolve) => {{
+				const handleSuccess = () => resolve({{ status: 'ok' }});
+				const handleError = (event) => resolve({{
+					status: 'error',
+					code: String(event?.type ?? 'load-error'),
+					message: String(event?.message ?? ''),
+				}});
+				script.addEventListener('load', handleSuccess, {{ once: true }});
+				script.addEventListener('error', handleError, {{ once: true }});
+				script.addEventListener('abort', handleError, {{ once: true }});
+			}}),
+			new Promise((resolve) => {{
+				setTimeout(() => resolve({{ status: 'timeout' }}), {int(MAP_INIT_TIMEOUT_SEC * 1000)});
+			}}),
+		]);
+	}})();
+	"""
+
+	try:
+		result = await ui.run_javascript(js_code, timeout=MAP_INIT_TIMEOUT_SEC)
+	except asyncio.TimeoutError as timeout_error:
+		await log_info(
+			"[main_map] таймаут загрузки скрипта Google Maps",
+			type_msg="warning",
+			uid=uid,
+			reason=str(timeout_error),
+		)
+		return False
+	except Exception as script_error:  # noqa: BLE001
+		await log_info(
+			"[main_map] ошибка загрузки скрипта Google Maps",
+			type_msg="error",
+			uid=uid,
+			reason=str(script_error),
+		)
+		return False
+
+	if isinstance(result, dict):
+		status = str(result.get("status") or "")
+	else:
+		status = str(result or "")
+
+	if status != "ok":
+		await log_info(
+			"[main_map] скрипт Google Maps не загрузился",
+			type_msg="warning",
+			uid=uid,
+			status=status,
+			code=(result or {}).get("code") if isinstance(result, dict) else None,
+			message=(result or {}).get("message") if isinstance(result, dict) else None,
+		)
+		return False
+
+	_set_client_value(SCRIPT_FLAG_KEY, True)
+	return True
+
+
 async def _check_geolocation_permission(uid: int | None) -> str:
 	try:
 		result = await ui.run_javascript(  # type: ignore[arg-type]
@@ -403,12 +662,19 @@ async def render_main_map(
 	if uid is not None:
 		_set_client_value("main_map_geo_uid", uid)
 
+	theme_value = (user_data or {}).get("theme_mode") if isinstance(user_data, dict) else None
+	theme_mode = str(theme_value).lower().strip() if theme_value else "light"
+	use_dark_theme = theme_mode == "dark"
+	map_style = DARK_GOOGLE_MAP_STYLE if use_dark_theme else None
+
 	try:
 		await log_info(
 			"[main_map] старт отрисовки карты",
 			type_msg="info",
 			uid=uid,
 		)
+
+		await _ensure_gmaps_client_id(uid, user_data)
 
 		await _ensure_geo_error_handler()
 
@@ -421,7 +687,7 @@ async def render_main_map(
 			)
 			ui.notify(lang_dict("map_notify_gmaps_missing_key", safe_lang), type="warning")
 			with ui.column().classes("w-full items-center justify-center gap-2 q-pa-lg"):
-				ui.icon("map").classes("text-4xl text-negative")
+				ui.icon("near_me").classes("flat text-4xl text-negative")
 				ui.label(lang_dict("map_message_missing_api_key", safe_lang)).classes(
 					"text-negative text-center"
 				)
@@ -430,16 +696,79 @@ async def render_main_map(
 		fallback = await _resolve_fallback_coordinates(uid, safe_lang, user_data, api_key)
 		_set_client_value("main_map_last_fallback", fallback)
 
-		if not _get_client_value(SCRIPT_FLAG_KEY):
-			language_param = safe_lang.lower()
-			script_url = (
-				f"https://{GMAPS_HOST}/maps/api/js?key={api_key}&v=weekly"
-				f"&libraries=geometry&loading=async&language={language_param}"
-			)
+		script_ready = await _ensure_gmaps_script(api_key, safe_lang, uid)
+		if not script_ready:
+			ui.notify(lang_dict("map_notify_unexpected_error", safe_lang), type="warning")
+			return
+
+		# Стили карты и кнопки центрирования синхронизируем с темой интерфейса, скрываем служебные подписи
+		if not _get_client_value(CENTER_BUTTON_STYLE_KEY):
 			ui.add_head_html(
-				f'<script src="{script_url}" data-taxibot-gmaps="1" async defer></script>'
+				"""
+				<style>
+				.taxibot-map-center-container {
+					position: absolute;
+					right: 16px;
+					bottom: 16px;
+					z-index: 25;
+					pointer-events: none;
+				}
+				.taxibot-map-center-container > .taxibot-map-center-btn {
+					pointer-events: auto;
+				}
+				.taxibot-map-center-btn {
+					width: 56px;
+					height: 56px;
+					display: flex;
+					align-items: center;
+					justify-content: center;
+					cursor: pointer;
+					border-radius: 50%;
+					background: #ffffff;
+					border: none;
+					box-shadow: none;
+					color: #000000;
+					transition: transform 0.2s ease;
+					padding: 0;
+					outline: none;
+				}
+				.taxibot-map-center-btn:hover {
+					transform: scale(1.08);
+				}
+				.taxibot-map-center-btn:focus-visible {
+					outline: 2px solid currentColor;
+					outline-offset: 2px;
+				}
+				.taxibot-map-center-btn--hidden {
+					display: none;
+				}
+				.taxibot-map-center-btn__icon {
+					width: 32px;
+					height: 32px;
+					display: block;
+					fill: none;
+					stroke: currentColor;
+					stroke-width: 2;
+					stroke-linejoin: round;
+					stroke-linecap: round;
+				}
+				.taxibot-map-center-btn[data-theme="dark"] {
+					background: var(--q-primary, #1a73e8);
+					color: #ffffff;
+				}
+				.taxibot-map-center-btn[data-theme="light"] {
+					background: #ffffff;
+					color: #000000;
+				}
+				.taxibot-map-canvas .gm-style-cc,
+				.taxibot-map-canvas .gmnoprint.gm-style-mtc,
+				.taxibot-map-canvas .gm-style-cc + div {
+					display: none !important;
+				}
+				</style>
+				"""
 			)
-			_set_client_value(SCRIPT_FLAG_KEY, True)
+			_set_client_value(CENTER_BUTTON_STYLE_KEY, True)
 
 		# Контейнер карты заранее резервирует доступную высоту.
 		map_wrapper = ui.element("div").classes(
@@ -452,13 +781,16 @@ async def render_main_map(
 		)
 		with map_wrapper:
 			container_id = f"main-map-{uuid4().hex}"
-			map_canvas = ui.element("div").classes("w-full h-full")
+			map_canvas = ui.element("div").classes("w-full h-full taxibot-map-canvas")
 			map_canvas.props(f"id={container_id}")
 			map_canvas.style("width: 100%; height: 100%;")
 
 		permission_status = await _check_geolocation_permission(uid)
 		if permission_status in {"denied", "unsupported", "timeout"}:
 			await _notify_geo_issue(permission_status, fallback, safe_lang, uid)
+
+		center_button_enabled = permission_status not in {"denied", "unsupported"}
+		center_button_label = lang_dict("map_button_center", safe_lang)
 
 		init_payload = {
 			"containerId": container_id,
@@ -473,6 +805,12 @@ async def render_main_map(
 			"fallbackZoom": DEFAULT_FALLBACK_ZOOM,
 			"maxAgeMs": GEO_MAXIMUM_AGE_MS,
 			"timeoutMs": GEO_TIMEOUT_MS,
+			"mapStyle": map_style,
+			"darkMapStyle": DARK_GOOGLE_MAP_STYLE,
+			"initialTheme": "dark" if use_dark_theme else "light",
+			"enableCenterButton": center_button_enabled,
+			"centerButtonLabel": center_button_label,
+			"centerButtonTitle": center_button_label,
 		}
 
 		js_code = f"""
@@ -506,20 +844,28 @@ async def render_main_map(
 				return {{ status: 'container-missing' }};
 			}}
 			container.innerHTML = '';
+			if (window.__taxibot_map_state?.themeListener) {{
+				try {{ window.removeEventListener('theme:applied', window.__taxibot_map_state.themeListener); }} catch (_err) {{}}
+			}}
 			if (window.__taxibot_map_state?.watchId != null && navigator.geolocation) {{
 				try {{ navigator.geolocation.clearWatch(window.__taxibot_map_state.watchId); }} catch (_err) {{}}
 			}}
 			const maps = window.google.maps;
 			const initialCenter = opts.fallback ?? {{ lat: 0, lng: 0 }};
-			const map = new maps.Map(container, {{
+			const mapOptions = {{
 				center: initialCenter,
 				zoom: opts.fallback ? opts.fallbackZoom : 3,
 				gestureHandling: 'greedy',
+				disableDefaultUI: true,
 				streetViewControl: false,
 				mapTypeControl: false,
 				fullscreenControl: false,
-				zoomControl: true,
-			}});
+				zoomControl: false,
+			}};
+			if (Array.isArray(opts.mapStyle)) {{
+				mapOptions.styles = opts.mapStyle;
+			}}
+			const map = new maps.Map(container, mapOptions);
 			const marker = new maps.Marker({{
 				position: initialCenter,
 				map,
@@ -530,9 +876,98 @@ async def render_main_map(
 				map,
 				marker,
 				lastUpdate: null,
+				lastPosition: null,
 				watchId: null,
 				containerId: opts.containerId,
+				centerButton: null,
+				themeListener: null,
+				currentTheme: null,
 			}};
+			// Обновляем стиль карты и состояние контролов под активную тему пользователя
+			const applyThemeToMap = (theme) => {{
+				if (!map) {{
+					return;
+				}}
+				const rawTheme = typeof theme === 'string' ? theme.toLowerCase() : '';
+				const normalized = rawTheme === 'dark' ? 'dark' : 'light';
+				if (normalized !== state.currentTheme) {{
+					if (normalized === 'dark' && Array.isArray(opts.darkMapStyle)) {{
+						// Создаем копию настроек, чтобы Google Maps гарантированно применил новый стиль
+						const nextStyles = JSON.parse(JSON.stringify(opts.darkMapStyle));
+						map.setOptions({{ styles: nextStyles }});
+					}} else {{
+						map.setOptions({{ styles: null }});
+					}}
+					state.currentTheme = normalized;
+				}}
+				if (state.centerButton) {{
+					state.centerButton.dataset.theme = normalized;
+				}}
+			}};
+			const handleThemeApplied = (event) => {{
+				const next = event?.detail?.theme;
+				if (typeof next !== 'string') {{
+					return;
+				}}
+				applyThemeToMap(next);
+			}};
+			const ensureCenterButton = () => {{
+				if (!opts.enableCenterButton) {{
+					return null;
+				}}
+				let overlay = container.querySelector('.taxibot-map-center-container');
+				if (!overlay) {{
+					overlay = document.createElement('div');
+					overlay.className = 'taxibot-map-center-container';
+					container.appendChild(overlay);
+				}}
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.className = 'taxibot-map-center-btn taxibot-map-center-btn--hidden';
+				const buttonTheme = (state.currentTheme || (typeof opts.initialTheme === 'string' ? opts.initialTheme.toLowerCase() : 'light')) === 'dark' ? 'dark' : 'light';
+				button.dataset.theme = buttonTheme;
+				if (opts.centerButtonTitle) {{
+					button.title = opts.centerButtonTitle;
+				}}
+				if (opts.centerButtonLabel) {{
+					button.setAttribute('aria-label', opts.centerButtonLabel);
+				}} else if (opts.centerButtonTitle) {{
+					button.setAttribute('aria-label', opts.centerButtonTitle);
+				}}
+				const svgNS = 'http://www.w3.org/2000/svg';
+				const icon = document.createElementNS(svgNS, 'svg');
+				icon.setAttribute('viewBox', '0 0 24 24');
+				icon.setAttribute('focusable', 'false');
+				icon.setAttribute('aria-hidden', 'true');
+				icon.setAttribute('role', 'presentation');
+				icon.classList.add('taxibot-map-center-btn__icon');
+				// Используем иконку near_me, чтобы кнопка выглядела привычно для пользователей карт
+				const iconPath = document.createElementNS(svgNS, 'path');
+				iconPath.setAttribute('d', 'M21 3L3 10.53V11l7.45 2.48L13 21h.47L21 3z');
+				iconPath.setAttribute('fill', 'none');
+				iconPath.setAttribute('stroke', 'currentColor');
+				iconPath.setAttribute('stroke-width', '2');
+				iconPath.setAttribute('stroke-linejoin', 'round');
+				iconPath.setAttribute('stroke-linecap', 'round');
+				icon.appendChild(iconPath);
+				button.appendChild(icon);
+				button.addEventListener('click', () => {{
+					// Перемещаем карту к последней координате пользователя
+					const coords = state.lastPosition;
+					if (!coords) {{
+						return;
+					}}
+					const target = new maps.LatLng(coords.latitude, coords.longitude);
+					map.panTo(target);
+					const desiredZoom = opts.initialZoom ?? {DEFAULT_INITIAL_ZOOM};
+					if (map.getZoom() < desiredZoom) {{
+						map.setZoom(desiredZoom);
+					}}
+				}});
+				overlay.replaceChildren(button);
+				return button;
+			}};
+			state.centerButton = ensureCenterButton();
 			const updateMarker = (coords) => {{
 				if (!coords) return;
 				const nextPos = new maps.LatLng(coords.latitude, coords.longitude);
@@ -542,6 +977,13 @@ async def render_main_map(
 					map.panTo(nextPos);
 				}}
 				state.lastUpdate = Date.now();
+				state.lastPosition = {{
+					latitude: coords.latitude,
+					longitude: coords.longitude,
+				}};
+				if (state.centerButton && state.centerButton.classList.contains('taxibot-map-center-btn--hidden')) {{
+					state.centerButton.classList.remove('taxibot-map-center-btn--hidden');
+				}}
 			}};
 			if (opts.fallback) {{
 				const fallbackPos = new maps.LatLng(opts.fallback.lat, opts.fallback.lng);
@@ -569,6 +1011,14 @@ async def render_main_map(
 					emitEvent('main_map_geo_error', {{ code: 'unsupported', message: 'Geolocation API missing' }});
 				}}
 			}}
+			const initialTheme = typeof window.__THEME_LAST === 'string' ? window.__THEME_LAST : opts.initialTheme;
+			if (initialTheme) {{
+				applyThemeToMap(initialTheme);
+			}}
+			try {{
+				window.addEventListener('theme:applied', handleThemeApplied);
+				state.themeListener = handleThemeApplied;
+			}} catch (_err) {{}}
 			window.__taxibot_map_state = state;
 			return {{ status: 'ok' }};
 		}})();

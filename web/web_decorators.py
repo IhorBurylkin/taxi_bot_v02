@@ -422,34 +422,53 @@ if (window.__syncing_theme_toggle) return;
 
 const dark = %s;
 const desired = dark ? 'dark' : 'light';
+let appliedViaBootstrap = false;
 
-// Сохранить выбор
+// Сохраняем выбор темы независимо от способа применения
 try { localStorage.setItem('theme_override', desired); } catch {}
 
-// Применить тему через Quasar
-try { window.Quasar?.Dark?.set?.(dark); } catch {}
-
-// Классы на body
-const body = document.body;
-body.classList.toggle('body--dark', dark);
-body.classList.toggle('body--light', !dark);
-
-// Цветовая схема и фон
-const bg = dark ? '#0b0b0c' : '#ffffff';
 try {
-  document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
-  document.documentElement.style.backgroundColor = bg;
-  body.style.backgroundColor = bg;
-  window.Telegram?.WebApp?.setBackgroundColor?.(bg);
+  if (window.__THEME_BOOTSTRAP?.applyTheme) {
+    window.__THEME_BOOTSTRAP.applyTheme(desired);
+    appliedViaBootstrap = true;
+  }
 } catch {}
 
-// Safari WebKit fix для цвета текста в инпутах
-try {
-  const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
-  inputs.forEach(el => {
-    el.style.webkitTextFillColor = getComputedStyle(el).color;
-  });
-} catch {}
+if (!appliedViaBootstrap) {
+  // Применить тему через Quasar
+  try { window.Quasar?.Dark?.set?.(dark); } catch {}
+
+  // Классы на body
+  const body = document.body;
+  body.classList.toggle('body--dark', dark);
+  body.classList.toggle('body--light', !dark);
+
+  // Цветовая схема и фон
+  const bg = dark ? '#0b0b0c' : '#ffffff';
+  try {
+    document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
+    document.documentElement.style.backgroundColor = bg;
+    body.style.backgroundColor = bg;
+    window.Telegram?.WebApp?.setBackgroundColor?.(bg);
+  } catch {}
+
+  // Safari WebKit fix для цвета текста в инпутах
+  try {
+    const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
+    inputs.forEach(el => {
+      el.style.webkitTextFillColor = getComputedStyle(el).color;
+    });
+  } catch {}
+
+  try {
+    window.__THEME_LAST = desired;
+    window.dispatchEvent(new CustomEvent('theme:applied', { detail: { theme: desired } }));
+  } catch {}
+} else {
+  try {
+    window.__THEME_LAST = desired;
+  } catch {}
+}
 
 // Асинхронное сохранение в БД через sendBeacon
 const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || localStorage.getItem('tg_user_id');

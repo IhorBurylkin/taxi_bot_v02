@@ -589,11 +589,6 @@ async def support_admin_reply(message: Message):
         if SUPPORT_THREAD_ID is not None:
             if getattr(message, "message_thread_id", None) != SUPPORT_THREAD_ID:
                 # Другой топик — игнорируем молча
-                await log_info(
-                    "[support_admin_reply] пропуск из-за несоответствия thread_id",
-                    type_msg="warning",
-                    user_id=admin_id,
-                )
                 return
 
         # Поднимаемся по reply-цепочке и ищем user_id в шапке

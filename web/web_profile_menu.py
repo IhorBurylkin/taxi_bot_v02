@@ -596,29 +596,49 @@ async def profile_menu(
         async def _apply_theme_js(mode: str) -> None:
             """Применяет тему через готовую реализацию на фронте."""
             try:
+                # Через JS оповещаем фронт и подписчиков (карта) о смене темы
                 js = f"""
                 if (window.__syncing_theme_toggle) return;
                 const desired = '{mode}';
-                const dark = desired === 'dark';
-                try {{ window.Quasar?.Dark?.set?.(dark); }} catch {{}}
-                const body = document.body;
-                body.classList.toggle('body--dark', dark);
-                body.classList.toggle('body--light', !dark);
-                const bg = dark ? '#0b0b0c' : '#ffffff';
+                try {{ localStorage.setItem('theme_override', desired); }} catch {{}}
+                let appliedViaBootstrap = false;
                 try {{
-                document.documentElement.style.setProperty('color-scheme', dark ? 'dark' : 'light');
-                document.documentElement.style.backgroundColor = bg;
-                body.style.backgroundColor = bg;
-                window.Telegram?.WebApp?.setBackgroundColor?.(bg);
+                    if (window.__THEME_BOOTSTRAP?.applyTheme) {{
+                        window.__THEME_BOOTSTRAP.applyTheme(desired);
+                        appliedViaBootstrap = true;
+                    }}
                 }} catch {{}}
+                if (!appliedViaBootstrap) {{
+                    const darkFlag = desired === 'dark';
+                    try {{ window.Quasar?.Dark?.set?.(darkFlag); }} catch {{}}
+                    const body = document.body;
+                    body.classList.toggle('body--dark', darkFlag);
+                    body.classList.toggle('body--light', !darkFlag);
+                    const bg = darkFlag ? '#0b0b0c' : '#ffffff';
+                    try {{
+                        document.documentElement.style.setProperty('color-scheme', darkFlag ? 'dark' : 'light');
+                        document.documentElement.style.backgroundColor = bg;
+                        body.style.backgroundColor = bg;
+                        window.Telegram?.WebApp?.setBackgroundColor?.(bg);
+                    }} catch {{}}
+                    try {{
+                        const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
+                        inputs.forEach(el => {{ el.style.webkitTextFillColor = getComputedStyle(el).color; }});
+                    }} catch {{}}
+                    try {{
+                        window.__THEME_LAST = desired;
+                        window.dispatchEvent(new CustomEvent('theme:applied', {{ detail: {{ theme: desired }} }}));
+                    }} catch {{}}
+                }}
                 try {{
-                const inputs = document.querySelectorAll('.q-field__native, .q-field__input');
-                inputs.forEach(el => {{ el.style.webkitTextFillColor = getComputedStyle(el).color; }});
+                    if (appliedViaBootstrap) {{
+                        window.__THEME_LAST = desired;
+                    }}
                 }} catch {{}}
                 const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || localStorage.getItem('tg_user_id');
                 if (uid) {{
-                const blob = new Blob([JSON.stringify({{ user_id: uid, theme: desired }})], {{type: 'application/json'}});
-                navigator.sendBeacon('/api/theme', blob);
+                    const blob = new Blob([JSON.stringify({{ user_id: uid, theme: desired }})], {{type: 'application/json'}});
+                    navigator.sendBeacon('/api/theme', blob);
                 }}
                 """
                 await ui.run_javascript(js)
@@ -3537,11 +3557,11 @@ async def profile_menu(
             with root:
                 # контейнер даёт боковые отступы, карточка по полной ширине
                 with ui.column().classes('full-width window-height flex flex-col'):
-                    header_card = ui.card().classes('w-full q-mt-md q-mb-sm gap-4')
+                    header_card = ui.card().classes('w-full q-mb-sm gap-4')
                     with header_card:
-                        with ui.row().classes("items-center gap-4 wrap"):
+                        with ui.row().classes("items-center gap-4 wrap w-full"):
                             avatar = ui.avatar().props("size=84").classes(
-                                "profile-avatar"
+                                "profile-avatar items-center "
                             )
                             if avatar_url:
                                 avatar.props("color=transparent text-color=transparent")
@@ -3550,30 +3570,30 @@ async def profile_menu(
                                 )
                                 with avatar:
                                     ui.image(avatar_url).classes(
-                                        "w-full h-full"
+                                        "items-center w-full h-full"
                                     ).style(
                                         "object-fit: cover; border-radius: inherit;"
                                     )
                             else:
                                 avatar.props("icon=person color=primary text-color=white")
 
-                            with ui.column().classes("gap-1"):
-                                ui.label(
-                                    user.get("first_name")
-                                    or lang_dict("unknown_user", current_lang)
-                                ).props("text-color=primary").classes("text-h6")
-                                with ui.row().classes("items-center gap-2 text-body1 text-primary"):
-                                    ui.icon("star").props("color=primary size=22")
-                                    ui.label(lang_dict(rating_key,current_lang,value=rating_value))
-                                if current_role == "driver":
-                                    verify_dr = await verify_driver(uid)
-                                    with ui.row().classes("items-center gap-2 text-body1"):
-                                        if verify_dr:
-                                            ui.icon("verified_user").props("color=green size=22")
-                                            ui.label(lang_dict("verified_driver", current_lang)).classes("text-green")
-                                        else:
-                                            ui.icon("warning").props("color=yellow size=22")
-                                            ui.label(lang_dict("unverified_driver", current_lang)).classes("text-yellow")
+                        with ui.column().classes("gap-1"):
+                            ui.label(
+                                user.get("first_name")
+                                or lang_dict("unknown_user", current_lang)
+                            ).props("text-color=primary").classes("text-h6")
+                            with ui.row().classes("items-center gap-2 text-body1 text-primary"):
+                                ui.icon("star").props("color=primary size=22")
+                                ui.label(lang_dict(rating_key,current_lang,value=rating_value))
+                            if current_role == "driver":
+                                verify_dr = await verify_driver(uid)
+                                with ui.row().classes("items-center gap-2 text-body1"):
+                                    if verify_dr:
+                                        ui.icon("verified_user").props("color=green size=22")
+                                        ui.label(lang_dict("verified_driver", current_lang)).classes("text-green")
+                                    else:
+                                        ui.icon("warning").props("color=yellow size=22")
+                                        ui.label(lang_dict("unverified_driver", current_lang)).classes("text-yellow")
                                     
 
                     with ui.card().classes("w-full q-mb-sm gap-4"):
