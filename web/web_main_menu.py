@@ -37,7 +37,6 @@ FALLBACK_FAILED_LOGGED_KEY = "main_map_fallback_failed_logged"
 FALLBACK_NOTIFIED_KEY = "main_map_fallback_notified"
 FALLBACK_FAILED_NOTIFIED_KEY = "main_map_fallback_failed_notified"
 CENTER_BUTTON_STYLE_KEY = "main_map_center_button_style_added"
-USER_CLIENT_CACHE_KEY = "main_map_gmaps_client_id"
 
 MAP_INIT_TIMEOUT_SEC = 12.0
 GEO_PERMISSION_TIMEOUT_SEC = 3.0
@@ -85,12 +84,13 @@ def _get_client_value(key: str, default: Any = None) -> Any:
 	return app.storage.client.get(key, default)
 
 
-def _set_user_value(key: str, value: Any) -> None:
-	app.storage.user[key] = value
-
-
-def _get_user_value(key: str, default: Any = None) -> Any:
-	return app.storage.user.get(key, default)
+def _get_configured_client_id() -> str | None:
+	env_value = os.getenv("GMAPS_CLIENT_ID")
+	if env_value:
+		return env_value.strip()
+	if GMAPS_CLIENT_ID:
+		return str(GMAPS_CLIENT_ID).strip()
+	return None
 
 
 def _get_configured_client_id() -> str | None:
@@ -117,28 +117,10 @@ async def _append_signature(
 	if not GMAPS_URL_SIGNING_SECRET:
 		return params
 
-	client_id_value: str | None
-	configured_id = _get_configured_client_id()
-	if configured_id:
-		client_id_value = configured_id
-	else:
-		stored_user = _get_user_value(USER_CLIENT_CACHE_KEY)
-		stored_client = _get_client_value(USER_CLIENT_CACHE_KEY)
-		candidate = stored_user or stored_client
-		client_id_value = str(candidate) if candidate else None
+	client_id_value = _get_configured_client_id()
 
 	if not client_id_value:
-		global SIGNATURE_DISABLED_LOGGED
-		if not SIGNATURE_DISABLED_LOGGED:
-			SIGNATURE_DISABLED_LOGGED = True
-			await log_info(
-				"[main_map] подпись запросов отключена: отсутствует client id",
-				type_msg="warning",
-				uid=uid,
-			)
 		return params
-
-	_set_client_value(USER_CLIENT_CACHE_KEY, client_id_value)
 
 	try:
 		padded = GMAPS_URL_SIGNING_SECRET + "=" * (-len(GMAPS_URL_SIGNING_SECRET) % 4)
@@ -158,73 +140,6 @@ async def _append_signature(
 			reason=str(sign_error),
 		)
 		return params
-
-
-def _extract_client_id(source: dict[str, Any] | None) -> str | None:
-	"""Извлекаем client id из записи пользователя."""
-	if not isinstance(source, dict):
-		return None
-	for field in ("gmaps_client_id", "client_id", "google_client_id"):
-		value = source.get(field)
-		if isinstance(value, (str, int)) and str(value).strip():
-			return str(value).strip()
-	return None
-
-
-async def _ensure_gmaps_client_id(uid: int | None, user_data: dict | None) -> str | None:
-	"""Гарантируем наличие client id в storage для подписи запросов."""
-	try:
-		if stored := _get_user_value(USER_CLIENT_CACHE_KEY):
-			return str(stored)
-
-		configured_id = _get_configured_client_id()
-		if configured_id:
-			client_value = configured_id
-			_set_user_value(USER_CLIENT_CACHE_KEY, client_value)
-			_set_client_value(USER_CLIENT_CACHE_KEY, client_value)
-			return client_value
-
-		candidate = _extract_client_id(user_data)
-
-		resolved_user: dict[str, Any] | None = None
-		if candidate is None and uid is not None:
-			try:
-				resolved_user = await get_user_data(USERS_TABLE_NAME, uid)
-			except Exception as db_error:  # noqa: BLE001
-				await log_info(
-					"[main_map] не удалось прочитать client id из БД",
-					type_msg="warning",
-					uid=uid,
-					reason=str(db_error),
-				)
-			else:
-				candidate = _extract_client_id(resolved_user)
-
-		if candidate:
-			_set_user_value(USER_CLIENT_CACHE_KEY, candidate)
-			_set_client_value(USER_CLIENT_CACHE_KEY, candidate)
-			await log_info(
-				"[main_map] client id сохранён в storage",
-				type_msg="info",
-				uid=uid,
-			)
-			return candidate
-
-		await log_info(
-			"[main_map] client id недоступен в профиле",
-			type_msg="warning",
-			uid=uid,
-			user_keys=sorted((user_data or {}).keys()),
-			resolved_keys=sorted((resolved_user or {}).keys()) if resolved_user else None,
-		)
-	except Exception as ensure_error:  # noqa: BLE001
-		await log_info(
-			"[main_map] ошибка подготовки client id",
-			type_msg="error",
-			uid=uid,
-			reason=str(ensure_error),
-		)
-	return None
 
 
 async def _log_fallback_usage(
@@ -673,8 +588,6 @@ async def render_main_map(
 			type_msg="info",
 			uid=uid,
 		)
-
-		await _ensure_gmaps_client_id(uid, user_data)
 
 		await _ensure_geo_error_handler()
 

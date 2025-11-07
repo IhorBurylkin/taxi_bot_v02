@@ -145,6 +145,7 @@ TABLES_SCHEMAS = {
         "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
     },
 
+    # глобальные настройки бота
     "config": {
         "id": "SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1)",   # одна запись-конфиг (singleton)
 
@@ -163,11 +164,13 @@ TABLES_SCHEMAS = {
         "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"        # техническое поле обновления
     },
 
+    # обращения в поддержку
     "support_requests": {
         "user_id": "BIGSERIAL PRIMARY KEY",
         "messages": "JSONB"
     },
 
+    # отложенные уведомления (например, при недоступности пользователя)
     "pending_notifications": {
         "user_id": "BIGINT PRIMARY KEY",
         "messages": "JSONB",
