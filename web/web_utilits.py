@@ -2,10 +2,12 @@ import asyncio
 import base64
 import contextlib
 import imghdr
+import json
 import os
+import time
 from datetime import datetime
 from uuid import uuid4
-from typing import Any, Sequence, Optional
+from typing import Any, Sequence, Optional, Callable, Awaitable
 from nicegui import ui, app
 from pathlib import Path
 from web.web_notify import bind_current_client_for_user
@@ -13,7 +15,7 @@ from log.log import log_info
 from db.db_utils import get_user_data, update_table
 from config.config_utils import lang_dict
 from aiogram.exceptions import TelegramAPIError
-from config.config import TEST_TG_ACCOUNT_ID, GMAPS_API_KEY
+from config.config import TEST_TG_ACCOUNT_ID, GMAPS_API_KEY, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGES
 
 
 IMAGES_ROOT = Path('images')
@@ -41,9 +43,21 @@ async def _safe_js(code: str, *, timeout: float = 3.0, target: Any | None = None
   client_id: Any | None = None
 
   if target is not None:
-    client_obj = getattr(target, "client", None)
+    if hasattr(target, "run_javascript"):
+      client_obj = target
+    else:
+      client_obj = getattr(target, "client", None)
   if client_obj is None:
-    client_obj = getattr(ui.context, "client", None)
+    try:
+      client_obj = getattr(ui.context, "client", None)
+    except RuntimeError as ctx_error:
+      asyncio.create_task(
+        log_info(
+          f"[js][контекст] клиент недоступен: {ctx_error!r}",
+          type_msg="warning",
+        )
+      )
+      client_obj = None
   if client_obj is not None:
     client_id = getattr(client_obj, "id", None)
 
@@ -110,6 +124,111 @@ async def _safe_js(code: str, *, timeout: float = 3.0, target: Any | None = None
     )
     return False
 
+
+class TelegramBackButton:
+  """Управляет штатной кнопкой Back в Telegram WebApp."""
+
+  def __init__(self, *, client: Any | None = None) -> None:
+    if client is not None:
+      resolved_client = client
+    else:
+      try:
+        resolved_client = getattr(ui.context, "client", None)
+      except RuntimeError as ctx_error:
+        asyncio.create_task(
+          log_info(
+            "[back_button] клиент недоступен при инициализации",
+            type_msg="warning",
+            reason=str(ctx_error),
+          )
+        )
+        resolved_client = None
+
+    self._client = resolved_client
+    self._event_name = f"tg_back_button_{uuid4().hex}"
+    self._listener = None
+    self._handler: Callable[[], Awaitable[None] | None] | None = None
+    self._active = False
+
+    client_ref = self._client
+    disconnect_cb = getattr(client_ref, "on_disconnect", None)
+    if callable(disconnect_cb):
+      disconnect_cb(lambda: asyncio.create_task(self.deactivate()))
+
+  async def activate(self, handler: Callable[[], Awaitable[None] | None]) -> None:
+    """Показывает кнопку и вешает обработчик нажатия."""
+
+    self._handler = handler
+    if self._listener is None:
+      async def _dispatch(_event: Any | None = None) -> None:
+        await self._emit_handler()
+
+      self._listener = ui.on(self._event_name, _dispatch)
+
+    if self._client is not None:
+      await _safe_js(
+        (
+          "(() => {"
+          "  const tg = window.Telegram?.WebApp;"
+          "  if (!tg?.BackButton) { return false; }"
+          f"  const key = {json.dumps(self._event_name)};"
+          "  const registry = window.__taxibot_back_registry || (window.__taxibot_back_registry = {});"
+          "  const existing = registry[key];"
+          "  if (existing) { try { tg.BackButton.offClick(existing); } catch (_err) {} }"
+          "  const handler = () => { try { emitEvent(key); } catch (emitError) { console.warn('emitEvent back failed', emitError); } };"
+          "  registry[key] = handler;"
+          "  tg.BackButton.onClick(handler);"
+          "  tg.BackButton.show();"
+          "  return true;"
+          "})();"
+        ),
+        target=self._client,
+      )
+      self._active = True
+
+  async def deactivate(self) -> None:
+    """Скрывает кнопку и снимает обработчик."""
+
+    if self._listener is not None:
+      try:
+        self._listener.unsubscribe()
+      except Exception:
+        pass
+      self._listener = None
+
+    if self._client is not None:
+      await _safe_js(
+        (
+          "(() => {"
+          "  const tg = window.Telegram?.WebApp;"
+          "  if (!tg?.BackButton) { return false; }"
+          f"  const key = {json.dumps(self._event_name)};"
+          "  const registry = window.__taxibot_back_registry;"
+          "  const handler = registry?.[key];"
+          "  if (handler) { try { tg.BackButton.offClick(handler); } catch (_err) {} delete registry[key]; }"
+          "  tg.BackButton.hide();"
+          "  return true;"
+          "})();"
+        ),
+        target=self._client,
+      )
+    self._active = False
+    self._handler = None
+
+  async def _emit_handler(self) -> None:
+    """Безопасно вызывает обработчик из Python."""
+
+    if self._handler is None:
+      return
+    try:
+      result = self._handler()
+      if asyncio.iscoroutine(result):
+        await result
+    except Exception as error:  # noqa: BLE001
+      await log_info(
+        "[back_button] ошибка обработчика", type_msg="error", reason=str(error)
+      )
+
 async def _get_uid() -> int | None:
     js = """
     new Promise(async (resolve) => {
@@ -134,6 +253,71 @@ async def _get_uid() -> int | None:
         return int(uid) if uid else None
     except:
         return None
+    
+async def _get_user_lang(supported: Optional[Sequence[str]] = None) -> str:
+    """
+    Возвращает язык интерфейса, не обращаясь к БД:
+    1) Telegram.WebApp.initDataUnsafe.user.language_code
+    2) Telegram.WebApp.language_code
+    3) localStorage['lang']
+    4) navigator.language / navigator.languages[0]
+    5) app.storage.user['lang'] (fallback)
+    Приводит к списку поддерживаемых языков.
+    """
+    try:
+        # читаем список поддерживаемых из config; если нет — дефолт
+        supported_langs = list(supported or SUPPORTED_LANGUAGES)
+
+        # локальный дефолт из хранилища UI
+        default_lang = (app.storage.user.get("lang") or DEFAULT_LANGUAGES)
+
+        # JS: берём коды из TWA/браузера/LS
+        js = """
+        new Promise(async (resolve) => {
+          const pick = v => (typeof v === 'string' && v.trim()) ? v.trim() : null;
+          const tg   = window?.Telegram?.WebApp;
+          const c1   = pick(tg?.initDataUnsafe?.user?.language_code);
+          const c2   = pick(tg?.language_code);
+          let  c3    = null;
+          try { c3 = pick(localStorage.getItem('lang')); } catch(_){}
+          const c4   = pick(navigator?.language) || (Array.isArray(navigator?.languages) ? pick(navigator.languages[0]) : null);
+          resolve(c1 || c2 || c3 || c4 || null);
+        })
+        """
+        try:
+            code = await ui.run_javascript(js, timeout=1.6)
+        except Exception as js_err:
+            code = None
+            await log_info("[get_user_lang] JS не вернул язык (используем fallback)", type_msg="warning", reason=str(js_err))
+
+        # нормализация: ru-RU -> ru, uk-UA -> uk, и т.п.
+        lang = (str(code or "")).strip().lower()
+        if "-" in lang:
+            lang = lang.split("-", 1)[0]
+
+        # маппинг синонимов и валидация поддерживаемых
+        if lang in {"ua", "uk-ua"}:   # исторический синоним
+            lang = "uk"
+        if not lang:
+            lang = str(default_lang).strip().lower() or "en"
+        if lang not in supported_langs:
+            lang = "en" if "en" in supported_langs else supported_langs[0]
+
+        # сохраняем выбор локально (для последующих заходов)
+        app.storage.user["lang"] = lang
+        try:
+            await _safe_js(f"try{{localStorage.setItem('lang', {json.dumps(lang)})}}catch(_){{}}", timeout=1.0)
+        except Exception as ls_err:
+            await log_info("[get_user_lang] не удалось сохранить язык в localStorage", type_msg="warning", reason=str(ls_err))
+
+        await log_info(f"[get_user_lang] выбран язык: {lang}", type_msg="info")
+        return lang
+
+    except Exception as e:
+        # аварийный, но предсказуемый фолбэк
+        await log_info(f"[get_user_lang][ОШИБКА] {e!r}", type_msg="error")
+        app.storage.user["lang"] = "en"
+        return "en"
 
 # Допустимые расширения для сохранения файлов
 ALLOWED_UPLOAD_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.pdf'}
@@ -526,7 +710,7 @@ async def get_user_data_uid_lang():
   uid: int | None = None
   try:
     uid = await _get_uid()  # берём из Telegram.WebApp.initDataUnsafe.user.id
-    default_lang = app.storage.user.get('lang') or 'en'
+    default_lang = app.storage.user.get('lang') or await _get_user_lang() or DEFAULT_LANGUAGES
 
     if not uid:
       # вне Telegram Mini App (или ранний рендер) uid отсутствует — возвращаем корректную тройку
@@ -540,7 +724,45 @@ async def get_user_data_uid_lang():
 
     await bind_current_client_for_user(int(uid))
 
-    user_data = await get_user_data('users', uid)
+    # ------------------------------------------------------------
+    # Читаем профиль из кеша NiceGUI, чтобы не дёргать БД каждый раз.
+    # ------------------------------------------------------------
+    cache_key = '_user_profile_cache'
+    cache_entry: dict[str, Any] | None = app.storage.user.get(cache_key)
+    cached_user: dict[str, Any] | None = None
+    if cache_entry and isinstance(cache_entry, dict):
+      expires_at = cache_entry.get('expires_at')
+      payload = cache_entry.get('payload')
+      if isinstance(expires_at, (int, float)) and expires_at > time.time() and isinstance(payload, dict):
+        cached_user = payload
+        await log_info(
+          "[get_user_data_uid_lang] профиль получен из кеша NiceGUI",
+          type_msg="info",
+          uid=uid,
+        )
+
+    user_data = cached_user
+    if user_data is None:
+      try:
+        user_data = await get_user_data('users', uid)
+        if user_data:
+          app.storage.user[cache_key] = {
+            'payload': user_data,
+            'expires_at': time.time() + 60.0,
+          }
+          await log_info(
+            "[get_user_data_uid_lang] профиль загружен из БД и кеширован",
+            type_msg="info",
+            uid=uid,
+          )
+      except Exception as db_error:
+        await log_info(
+          f"[get_user_data_uid_lang][ОШИБКА БД] {db_error!r}",
+          type_msg="error",
+          uid=uid,
+        )
+        user_data = None
+
     user_lang = (user_data or {}).get('language') or default_lang
 
     await log_info(

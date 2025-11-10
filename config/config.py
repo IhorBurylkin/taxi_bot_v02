@@ -23,10 +23,12 @@ def _load_config_cached(file_path: str):
     """Внутренняя функция для кеширования загрузки"""
     return load_config(file_path)
 
+
 def get_settings(file_path: str):
     """Возвращает глубокую копию конфига для безопасной мутации"""
     cached = _load_config_cached(file_path)
     return deepcopy(cached) if cached else None
+
 
 config = get_settings("config/config.json")
 lang_dict = get_settings("config/lang_dict.json")
@@ -61,25 +63,30 @@ DB_DSN = config.get("DB_DSN")
 
 STARS_ACCEPT_PRICE = config.get("STARS_ACCEPT_PRICE", 0)
 STARS_ITEM_LABEL = config.get("STARS_ITEM_LABEL", "Accepting an order")
+SERVICE_COMMISSION_PERCENT = config.get("SERVICE_COMMISSION_PERCENT", 0)
+STAR_RATE = config.get("STAR_RATE", {})
+ORDER_ACCEPT_TIMEOUT_SEC = config.get("ORDER_ACCEPT_TIMEOUT_SEC", 45)
+AWAITING_FEE_TIMEOUT_SEC = config.get("AWAITING_FEE_TIMEOUT_SEC", 60)
+WAIT_FREE_WINDOW_SEC = config.get("WAIT_FREE_WINDOW_SEC", 300)
 
 _BALANCE_PRESETS = config.get("_BALANCE_PRESETS")
-STARS_MULTIPLIER = config.get("STARS_MULTIPLIER") 
+STARS_MULTIPLIER = config.get("STARS_MULTIPLIER")
 
 TEST_TG_ACCOUNT_ID = config.get("TEST_TG_ACCOUNT_ID")
 
 MESSAGES = lang_dict.get("MESSAGES")
-
 TABLES_SCHEMAS = {
     "users": {
         "user_id": "BIGSERIAL PRIMARY KEY",
         "username": "VARCHAR(50)",
         "first_name": "VARCHAR(100)",
         "language": "VARCHAR(10) DEFAULT 'en'",
-        "theme_mode": "TEXT",  # 'light' | 'dark'
+        "theme_mode": "TEXT",
         "message_id": "BIGINT",
         "role": "VARCHAR(20) NOT NULL",
         "black_list": "BOOLEAN DEFAULT FALSE",
-        "balance": "NUMERIC(10,2) DEFAULT 0.0",
+        "balance": "BIGINT NOT NULL DEFAULT 0",
+        "balance_updated_at": "TIMESTAMPTZ",
         "transactions": "JSONB",
         "country": "VARCHAR(100)",
         "region": "VARCHAR(100)",
@@ -99,10 +106,8 @@ TABLES_SCHEMAS = {
         "rating_driver": "NUMERIC(3,2)",
         "trips_count_driver": "JSONB",
         "is_working": "BOOLEAN DEFAULT TRUE",
-        "verified_driver": "BOOLEAN DEFAULT FALSE",
+        "verified_driver": "BOOLEAN DEFAULT FALSE"
     },
-
-    # trip_start — БЕЗ DEFAULT now(); добавлены временные точки и id ключевых сообщений
     "orders": {
         "order_id": "BIGSERIAL PRIMARY KEY",
         "message_id": "BIGINT",
@@ -114,69 +119,72 @@ TABLES_SCHEMAS = {
         "city": "VARCHAR(100)",
         "address_from": "TEXT NOT NULL",
         "address_to": "TEXT NOT NULL",
-
-        # временные точки (для сводки и восстановления)
-        "in_place_at": "TIMESTAMPTZ",          # водитель нажал «Я на месте»
-        "scheduled_at": "TIMESTAMPTZ",     # запланированное время (если есть)
-        "come_out_at": "TIMESTAMPTZ",          # пассажир нажал «Я выхожу»
-        "auto_start_hint_at": "TIMESTAMPTZ",   # отправлен auto_start_hint
-        "trip_start": "TIMESTAMPTZ",           # фактический старт (start_btn)
-        "trip_end": "TIMESTAMPTZ",             # фактический конец
-
+        "in_place_at": "TIMESTAMPTZ",
+        "scheduled_at": "TIMESTAMPTZ",
+        "come_out_at": "TIMESTAMPTZ",
+        "auto_start_hint_at": "TIMESTAMPTZ",
+        "trip_start": "TIMESTAMPTZ",
+        "trip_end": "TIMESTAMPTZ",
         "distance_km": "NUMERIC(10,2)",
         "cost": "NUMERIC(10,2)",
         "commission": "NUMERIC(10,2)",
-
+        "commission_stars": "BIGINT",
+        "commission_tx_id": "BIGINT",
+        "accepted_at": "TIMESTAMPTZ",
         "status": "VARCHAR(20) NOT NULL",
         "initiator_id": "BIGINT REFERENCES users(user_id)",
         "reason": "TEXT",
-
-        # id ключевых сообщений (для редактирования/удаления и восстановления после рестартов)
-        "driver_main_msg_id": "BIGINT",        # главное сообщение водителя
-        "passenger_info_msg_id": "BIGINT",     # карточка пассажира
-        "driver_comeout_msg_id": "BIGINT",     # «Пассажир выходит»
-        "driver_auto_hint_msg_id": "BIGINT"    # auto_start_hint
+        "driver_main_msg_id": "BIGINT",
+        "passenger_info_msg_id": "BIGINT",
+        "driver_comeout_msg_id": "BIGINT",
+        "driver_auto_hint_msg_id": "BIGINT"
     },
-
-    # снапшоты рантайма между рестартами
+    "users_transactions": {
+        "tx_id": "BIGSERIAL PRIMARY KEY",
+        "user_id": "BIGINT NOT NULL REFERENCES users(user_id)",
+        "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "direction": "VARCHAR(10) NOT NULL",
+        "amount_stars": "BIGINT NOT NULL",
+        "reason": "VARCHAR(30) NOT NULL",
+        "order_id": "BIGINT REFERENCES orders(order_id)",
+        "related_tx_id": "BIGINT",
+        "meta": "JSONB"
+    },
+    "order_events": {
+        "event_id": "BIGSERIAL PRIMARY KEY",
+        "order_id": "BIGINT NOT NULL REFERENCES orders(order_id)",
+        "user_id": "BIGINT REFERENCES users(user_id)",
+        "role": "VARCHAR(20)",
+        "event": "VARCHAR(50) NOT NULL",
+        "payload": "JSONB",
+        "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+    },
     "bot_runtime": {
-        "key": "TEXT PRIMARY KEY",             # имя снапшота (например, ARRIVED_AT)
-        "payload": "JSONB NOT NULL",           # произвольный JSON-словарь
+        "key": "TEXT PRIMARY KEY",
+        "payload": "JSONB NOT NULL",
         "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
     },
-
-    # глобальные настройки бота
     "config": {
-        "id": "SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1)",   # одна запись-конфиг (singleton)
-
-        "cities": "JSONB NOT NULL DEFAULT '[]'::jsonb",           # список городов/настроек по городам
-        "country_choices": "JSONB NOT NULL DEFAULT '[]'::jsonb",   # список стран/настроек по странам
-        "stars_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",        # включение оплаты через Telegram Stars
-
+        "id": "SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1)",
+        "cities": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "country_choices": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "stars_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "check_country": "BOOLEAN NOT NULL DEFAULT FALSE",
         "region_in_bot": "BOOLEAN NOT NULL DEFAULT TRUE",
-
-        # имя оставлено как в вашем коде (опечатка намеренно сохранена)
-        "recruitment_scan_intervel": "INTEGER NOT NULL DEFAULT 30 CHECK (recruitment_scan_intervel > 0)",  # интервал сканирования, сек
-        "recruitment_max_minutes": "INTEGER NOT NULL DEFAULT 15 CHECK (recruitment_max_minutes > 0)",      # максимум подбора, минут
+        "recruitment_scan_intervel": "INTEGER NOT NULL DEFAULT 30 CHECK (recruitment_scan_intervel > 0)",
+        "recruitment_max_minutes": "INTEGER NOT NULL DEFAULT 15 CHECK (recruitment_max_minutes > 0)",
         "commission_percent": "NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (commission_percent >= 0)",
-
-        "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"        # техническое поле обновления
+        "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
     },
-
-    # обращения в поддержку
     "support_requests": {
         "user_id": "BIGSERIAL PRIMARY KEY",
         "messages": "JSONB"
     },
-
-    # отложенные уведомления (например, при недоступности пользователя)
     "pending_notifications": {
         "user_id": "BIGINT PRIMARY KEY",
         "messages": "JSONB",
         "level": "VARCHAR(10)",
         "position": "VARCHAR(20)",
         "created_at": "TIMESTAMPTZ NOT NULL DEFAULT now()"
-    },
-
+    }
 }

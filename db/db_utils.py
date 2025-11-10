@@ -900,6 +900,235 @@ async def get_latest_open_order_id_for_passenger(passenger_id: int) -> Optional[
         if connection:
             await release_connection(connection)
 
+async def get_active_order_for_driver(driver_id: int) -> Optional[Dict[str, Any]]:
+    """Возвращает активный заказ для водителя либо None."""
+    connection = None
+    try:
+        connection = await get_connection()
+        row = await connection.fetchrow(
+            """
+            SELECT *
+              FROM orders
+             WHERE driver_id = $1
+               AND status IN ('accepted','in_place','come_out','started','awaiting_fee')
+             ORDER BY order_date DESC NULLS LAST, order_id DESC
+             LIMIT 1
+            """,
+            driver_id,
+        )
+        if row:
+            await log_info(
+                "[db_utils.get_active_order_for_driver] найден активный заказ",
+                type_msg="info",
+                user_id=driver_id,
+                order_id=row["order_id"],
+            )
+            return dict(row)
+        await log_info(
+            "[db_utils.get_active_order_for_driver] активный заказ не найден",
+            type_msg="warning",
+            user_id=driver_id,
+        )
+        return None
+    except Exception as error:
+        await log_info(
+            f"[db_utils.get_active_order_for_driver] ошибка: {error}",
+            type_msg="error",
+            user_id=driver_id,
+        )
+        return None
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def list_available_orders_for_driver(
+    city: str | None,
+    limit: int = 20,
+    *,
+    exclude_user_id: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Возвращает список доступных заказов для водителя."""
+
+    connection = None
+    try:
+        connection = await get_connection()
+        clauses = ["status = 'pending'", "driver_id IS NULL"]
+        params: list[Any] = []
+
+        if city:
+            params.append(city)
+            clauses.append(f"COALESCE(city, '') = ${len(params)}")
+
+        if exclude_user_id is not None:
+            params.append(exclude_user_id)
+            clauses.append(f"COALESCE(passenger_id, 0) <> ${len(params)}")
+
+        params.append(limit)
+        where_sql = " AND ".join(clauses)
+        query = (
+            f"""
+            SELECT *
+              FROM orders
+             WHERE {where_sql}
+             ORDER BY scheduled_at NULLS LAST, order_date DESC NULLS LAST, order_id DESC
+             LIMIT ${len(params)}
+            """
+        )
+
+        rows = await connection.fetch(query, *params)
+        result = [dict(row) for row in rows]
+        await log_info(
+            "[db_utils.list_available_orders_for_driver] получены доступные заказы",
+            type_msg="info",
+            user_id=exclude_user_id,
+            count=len(result),
+        )
+        return result
+    except Exception as error:
+        await log_info(
+            f"[db_utils.list_available_orders_for_driver] ошибка: {error}",
+            type_msg="error",
+            user_id=exclude_user_id,
+        )
+        return []
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def list_future_orders_for_passenger(passenger_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """Возвращает список будущих поездок пассажира."""
+
+    connection = None
+    try:
+        connection = await get_connection()
+        rows = await connection.fetch(
+            """
+            SELECT *
+              FROM orders
+             WHERE passenger_id = $1
+               AND scheduled_at IS NOT NULL
+               AND scheduled_at > NOW()
+             ORDER BY scheduled_at ASC
+             LIMIT $2
+            """,
+            passenger_id,
+            limit,
+        )
+        result = [dict(row) for row in rows]
+        await log_info(
+            "[db_utils.list_future_orders_for_passenger] загружено поездок",
+            type_msg="info",
+            user_id=passenger_id,
+            count=len(result),
+        )
+        return result
+    except Exception as error:
+        await log_info(
+            f"[db_utils.list_future_orders_for_passenger] ошибка: {error}",
+            type_msg="error",
+            user_id=passenger_id,
+        )
+        return []
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def list_order_history_for_user(
+    user_id: int,
+    *,
+    role: Literal["passenger", "driver"],
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Возвращает историю поездок пользователя."""
+
+    connection = None
+    column = "passenger_id" if role == "passenger" else "driver_id"
+    try:
+        connection = await get_connection()
+        query = f"""
+            SELECT *
+              FROM orders
+             WHERE {column} = $1
+               AND status IN ('completed','canceled')
+             ORDER BY COALESCE(trip_end, order_date) DESC NULLS LAST, order_id DESC
+             LIMIT $2
+        """
+        rows = await connection.fetch(query, user_id, limit)
+        result = [dict(row) for row in rows]
+        await log_info(
+            "[db_utils.list_order_history_for_user] получена история поездок",
+            type_msg="info",
+            user_id=user_id,
+            role=role,
+            count=len(result),
+        )
+        return result
+    except Exception as error:
+        await log_info(
+            f"[db_utils.list_order_history_for_user] ошибка: {error}",
+            type_msg="error",
+            user_id=user_id,
+        )
+        return []
+    finally:
+        if connection:
+            await release_connection(connection)
+
+
+async def get_driver_stats_summary(driver_id: int) -> Dict[str, Any]:
+    """Собирает агрегированные метрики по заказам водителя."""
+
+    connection = None
+    try:
+        connection = await get_connection()
+        row = await connection.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+                COUNT(*) FILTER (WHERE status = 'canceled') AS canceled,
+                COUNT(*) FILTER (WHERE status IN ('accepted','in_place','come_out','started','awaiting_fee')) AS active,
+                COALESCE(SUM(commission), 0) AS total_commission,
+                COALESCE(SUM(cost), 0) AS total_revenue
+              FROM orders
+             WHERE driver_id = $1
+            """,
+            driver_id,
+        )
+        payload = dict(row) if row else {}
+        stats = {
+            "completed": int(payload.get("completed") or 0),
+            "canceled": int(payload.get("canceled") or 0),
+            "active": int(payload.get("active") or 0),
+            "total_commission": float(payload.get("total_commission") or 0),
+            "total_revenue": float(payload.get("total_revenue") or 0),
+        }
+        await log_info(
+            "[db_utils.get_driver_stats_summary] статистика собрана",
+            type_msg="info",
+            user_id=driver_id,
+            stats=stats,
+        )
+        return stats
+    except Exception as error:
+        await log_info(
+            f"[db_utils.get_driver_stats_summary] ошибка: {error}",
+            type_msg="error",
+            user_id=driver_id,
+        )
+        return {
+            "completed": 0,
+            "canceled": 0,
+            "active": 0,
+            "total_commission": 0.0,
+            "total_revenue": 0.0,
+        }
+    finally:
+        if connection:
+            await release_connection(connection)
+
 async def get_user_theme(user_id: int) -> str | None:
     """
     Возвращает 'light' / 'dark' или None, если записи нет/пусто.

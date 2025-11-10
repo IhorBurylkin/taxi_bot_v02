@@ -289,6 +289,7 @@ def _ensure_theme_assets_once() -> None:
   }
 
   .profile-avatar {
+    box-sizing: border-box; 
     border: 3px solid rgba(46,204,113,.35);
     background-color: transparent !important;
   }

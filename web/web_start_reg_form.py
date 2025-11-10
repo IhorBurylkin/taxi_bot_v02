@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import asyncio
 from db.db_utils import user_exists, update_table, insert_into_table
 from config.config_from_db import load_cities, load_country_choices
-from web.web_utilits import _save_upload, bind_enter_action
+from web.web_utilits import _save_upload, bind_enter_action, TelegramBackButton
 from config.config_utils import lang_dict
 from keyboards.inline_kb_verification import verification_inline_kb
 from log.log import log_info, send_info_msg
@@ -37,6 +37,12 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
         'car_image': None, 'techpass_image': None, 'driver_license': None,
     }
 
+    back_button = TelegramBackButton()
+    await back_button.deactivate()
+    step_sequence: list[str] = []
+    step_indexes: dict[str, int] = {}
+    current_step_index = {"value": 0}
+
     async def _on_submit_driver_form(e):
         # если нужно — здесь обновляете вашу модель/БД
         ui.notify(lang_dict('notify_ok_data', user_lang), type='positive')
@@ -49,8 +55,62 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
         )
         with container_ctx:
             if choice_role:
-                ui.label(lang_dict('title_registration', user_lang)).classes('text-2xl font-bold gap-2 q-ma-none q-mt-lg q-pa-none')
+                ui.label(lang_dict('title_registration', user_lang)).classes('text-2xl font-bold gap-2 q-ma-none q-mt-lg q-pa-none text-center self-center')
             with ui.stepper().props('vertical').classes('w-full q-pa-none q-ma-none') as st:
+                async def _step_next(context: str | None = None) -> None:
+                    """Переключает степпер на следующий шаг с логированием ошибок."""
+                    try:
+                        st.next()
+                    except Exception as nav_error:  # noqa: BLE001
+                        await log_info(
+                            "[start_reg_form] ошибка перехода вперёд",
+                            type_msg="error",
+                            uid=uid,
+                            context=context,
+                            reason=str(nav_error),
+                        )
+
+                async def _handle_back_click() -> None:
+                    """Возвращает пользователя на предыдущий шаг через Telegram BackButton."""
+                    idx = current_step_index["value"]
+                    if idx <= 0 or not step_sequence:
+                        return
+                    prev_name = step_sequence[idx - 1]
+                    try:
+                        st.set_value(prev_name)
+                    except Exception as nav_error:  # noqa: BLE001
+                        try:
+                            st.previous()
+                        except Exception as fallback_error:  # noqa: BLE001
+                            await log_info(
+                                "[start_reg_form] ошибка перехода назад",
+                                type_msg="error",
+                                uid=uid,
+                                reason=f"{nav_error}; fallback={fallback_error}",
+                            )
+
+                async def _sync_back_button(step_name: str | None) -> None:
+                    """Обновляет состояние Telegram BackButton в зависимости от текущего шага."""
+                    try:
+                        if not step_sequence:
+                            current_step_index["value"] = 0
+                            await back_button.deactivate()
+                            return
+                        base_step = step_sequence[0]
+                        idx = step_indexes.get(step_name or base_step, 0)
+                        current_step_index["value"] = idx
+                        if idx > 0:
+                            await back_button.activate(_handle_back_click)
+                        else:
+                            await back_button.deactivate()
+                    except Exception as sync_error:  # noqa: BLE001
+                        await log_info(
+                            "[start_reg_form] ошибка синхронизации BackButton",
+                            type_msg="error",
+                            uid=uid,
+                            reason=str(sync_error),
+                        )
+
                 # 1) Роль
                 if choice_role:
                     with ui.step(lang_dict('step_role', user_lang)).props('name=role').classes('w-full q-pa-none q-ma-none'):
@@ -79,9 +139,10 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                         sel_city.disable()
 
                     with ui.stepper_navigation().classes('w-full q-pa-none q-ma-none'):
-                        if choice_role:
-                            ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
-                        next2 = ui.button(lang_dict('btn_next', user_lang), on_click=lambda _: st.next()); next2.disable()
+                        async def _on_city_next(_):
+                            await _step_next('city')
+
+                        next2 = ui.button(lang_dict('btn_next', user_lang), on_click=_on_city_next); next2.disable()
 
                     def _rebuild_regions(country: str | None):
                         # Всегда сбрасываем и блокируем зависимые
@@ -145,7 +206,7 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                 with ui.step(lang_dict('step_phone', user_lang)).props('name=phone').classes('w-full q-pa-none q-ma-none') as step_phone:
                     async def _submit_phone(_):
                         if model.get('role') == 'driver':
-                            st.next()
+                            await _step_next('phone')
                         else:
                             await _finish_passenger(None)
 
@@ -194,7 +255,6 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                                     .classes('flex-1 min-w-0 self-stretch'))
 
                         with ui.stepper_navigation().classes('w-full q-pa-none q-ma-none'):
-                            ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
                             btn_next3   = ui.button(lang_dict('btn_next', user_lang)).props('type=submit')
                             btn_finish3 = ui.button(lang_dict('btn_finish', user_lang)).props('type=submit')
 
@@ -279,6 +339,7 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                                 )
                                 
                                 await log_info(f"[finish_passenger] Успешно завершено для uid={uid}", type_msg="info")
+                                await back_button.deactivate()
                                 ui.navigate.to('/main_app?tab=main')
                                 
                             except Exception as ex:
@@ -297,7 +358,7 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
 
                     async def _submit_license(_):
                         if license_ok['img']:
-                            st.next()
+                            await _step_next('driver_license')
                         else:
                             await ui.run_javascript("document.activeElement && document.activeElement.blur()")
 
@@ -308,7 +369,6 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                             up_license = ui.upload(label=lang_dict('upload_driver_license_label', user_lang)).props('accept="image/*" auto-upload').classes('w-full')
 
                         with ui.stepper_navigation().classes('w-full q-gutter-y-md q-pa-none q-ma-none'):
-                            ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
                             next_license = ui.button(lang_dict('btn_next', user_lang), on_click=_submit_license)
                             next_license.disable()
 
@@ -350,7 +410,7 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                         if model_ok and not color_ok:
                             await _focus(car_color); return
                         if model.get('car_brand') and model.get('car_model') and model.get('car_color') and car_ok['img']:
-                            st.next()
+                            await _step_next('car')
 
                     with ui.element('div').classes('w-full q-gutter-y-md gap-2'):
                         car_brand = ui.input(lang_dict('car_brand_label', user_lang)).props('enterkeyhint=next').classes('w-full')
@@ -368,8 +428,10 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                             up_car = ui.upload(label=lang_dict('upload_car_label', user_lang)).props('accept="image/*" auto-upload').classes('w-full')
 
                         with ui.stepper_navigation().classes('w-full q-gutter-y-md q-pa-none q-ma-none'):
-                            ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
-                            next4 = ui.button(lang_dict('btn_next', user_lang), on_click=lambda _: st.next())
+                            async def _on_car_next(_):
+                                await _step_next('car')
+
+                            next4 = ui.button(lang_dict('btn_next', user_lang), on_click=_on_car_next)
 
                         def _sync_car(*_):
                             model['car_brand'] = (car_brand.value or '').strip()
@@ -417,7 +479,6 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                             up_tp = ui.upload(label=lang_dict('upload_techpass_label', user_lang)).props('accept="image/*,application/pdf" auto-upload').classes('w-full')
 
                         with ui.stepper_navigation().classes('w-full q-gutter-y-md q-pa-none q-ma-none'):
-                            ui.button(lang_dict('btn_back', user_lang), on_click=lambda _: st.previous())
                             finish5 = ui.button(lang_dict('btn_finish', user_lang), on_click=_submit_docs) 
 
                     def _sync_docs(*_):
@@ -474,6 +535,7 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
 
                             ui.notify(lang_dict('notify_verification', user_lang), type='warning', position='center')
                             await log_info(f"[verify_driver] notify_user uid={uid}", type_msg="info")
+                            await back_button.deactivate()
                             ui.timer(5.0, lambda: ui.navigate.to('/main_app?tab=main'), once=True)
 
                             await send_info_msg(photo=[model['car_image'], model['techpass_image'], model['driver_license']], type_msg_tg="new_users", caption=f"Документы водителя {uid}")
@@ -484,26 +546,38 @@ async def start_reg_form_ui(uid, user_lang, user_data, choice_role) -> None:
                 
                 step_docs.visible = False
 
-            def _reveal_and_next(go_next: bool):
+                # Фиксируем порядок шагов для Telegram BackButton.
+                step_sequence[:] = ([] if not choice_role else ['role']) + ['city', 'phone', 'driver_license', 'car', 'docs']
+                step_indexes.clear()
+                step_indexes.update({name: idx for idx, name in enumerate(step_sequence)})
+
+            def _apply_flow_visibility() -> None:
+                """Обновляет доступность шагов после выбора роли."""
                 is_driver = (model.get('role') == 'driver')
-                step_city.visible  = True
+                step_city.visible = True
                 step_phone.visible = True
                 step_driver_license.visible = is_driver
-                step_car.visible   = is_driver
-                step_docs.visible  = is_driver
-                if go_next:
-                    st.next()
+                step_car.visible = is_driver
+                step_docs.visible = is_driver
 
             if choice_role:
-                next1.on_click(lambda _: _reveal_and_next(True))
+                async def _on_role_next(_):
+                    _apply_flow_visibility()
+                    await _step_next('role')
+
+                next1.on_click(_on_role_next)
                 st.set_value('role')
             else:
                 # Автоматически раскрываем шаги для водителя и переходим к городу
-                _reveal_and_next(None)
+                _apply_flow_visibility()
                 st.set_value('city')
+
+            initial_step = 'role' if choice_role else 'city'
+            await _sync_back_button(initial_step)
 
             async def _on_step_change(e):
                 val = getattr(e, 'value', None)
+                await _sync_back_button(val)
                 if val == 'car':
                     await bind_enter_action(car_brand, dst=car_model)
                     await bind_enter_action(car_model, dst=car_color)

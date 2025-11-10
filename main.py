@@ -18,6 +18,7 @@ from bot_instance import initialize_bots
 from config.config_from_db import ensure_config_exists
 from db.db_table_init import close_pool, create_pool, init_db_tables, monitor_pool_health
 from log.log import log_info, set_info_bot
+from log.json_watcher import run_json_watch
 from log.server_logs_scheduler import send_server_logs_once, start_daily_server_logs_task
 from handlers import commands, verification, support
 from web.web_app import start_server
@@ -130,6 +131,13 @@ async def main() -> None:
         loop = asyncio.get_running_loop()
         shutdown_event: asyncio.Event = asyncio.Event()
 
+        json_watch_task = None
+        try:
+            json_watch_task = asyncio.create_task(run_json_watch(".nicegui", shutdown_event))
+        except Exception as e:
+            # не блокируем запуск — просто логируем
+            await log_info(f"Не удалось запустить json_watcher: {e}", type_msg="warning")
+
         # Кроссплатформенная подписка на сигналы
         if sys.platform == "win32":
             signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
@@ -224,6 +232,12 @@ async def main() -> None:
                 #     await send_server_logs_once()
                 # except Exception as e:
                 #     print(f"Ошибка отправки финальных логов: {e}", file=sys.stderr)
+
+                #7 . Остановить json_watcher
+                if json_watch_task and not json_watch_task.done():
+                    json_watch_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await json_watch_task
                 
             except Exception as e:
                 await log_info(f"Ошибка shutdown: {e}", type_msg="error")

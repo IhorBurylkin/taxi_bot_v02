@@ -23,6 +23,7 @@ from web.web_utilits import (
     DEFAULT_AVATAR_DATA_URL,
     bind_enter_action,
     fetch_telegram_avatar,
+    TelegramBackButton,
     _save_upload,
     _safe_js,
     verify_driver,
@@ -73,7 +74,7 @@ active_tab: str = 'profile_list'
 upload_successful: bool = False
 
 
-async def profile_menu(
+async def render_profile_menu_tab(
     uid: int | None,
     user_lang: str,
     user_data: dict | None,
@@ -103,6 +104,9 @@ async def profile_menu(
     support_thread_cache: dict[str, Any] = dict(
         app.storage.user.get("support_thread") or {"items": [], "cursors": {}, "meta": {}}
     )
+
+    back_button = TelegramBackButton()
+    await back_button.deactivate()
 
     def _parse_support_ts_raw(value: str | None) -> datetime | None:
         """Превращает ISO8601-строку в datetime или возвращает None."""
@@ -680,20 +684,20 @@ async def profile_menu(
                 with reg_container:
                     # Верхняя панель с «X» справа
                     with ui.row().classes(
-                        "w-full items-center wrap q-pa-none q-mb-none"
+                        "w-full items-center wrap q-mt-xl q-pa-none q-mb-none"
                     ):
-                        ui.element("div").classes("flex-1")
-                        ui.button(
-                            icon="close",
-                            on_click=_close_registration,
-                        ).props("flat round dense size=md color=grey-6").classes("q-mr-none")
+                        # ui.element("div").classes("flex-1")
+                        # ui.button(
+                        #     icon="close",
+                        #     on_click=_close_registration,
+                        # ).props("flat round dense size=md color=grey-6").classes("q-mr-none")
                         # Если нужен tooltip и есть ключ в словаре, раскомментируй:
                         # .tooltip(lang_dict("dialog_close", current_lang))
 
-                    # Контент формы регистрации
-                    await start_reg_form_ui(
-                        uid, current_lang, user, choice_role=False
-                    )
+                        # Контент формы регистрации
+                        await start_reg_form_ui(
+                            uid, current_lang, user, choice_role=False
+                        )
 
             except Exception as reg_error:
                 await _log(
@@ -798,6 +802,7 @@ async def profile_menu(
                     "[profile_menu] возврат на корневой экран",
                     type_msg="info",
                 )
+                await _sync_back_button("profile_list")
                 if upload_successful:
                     try:
                         await update_table("users", uid, {"verified_driver": False})
@@ -845,12 +850,35 @@ async def profile_menu(
                             type_msg='error',
                         )
                 tabs.set_value("profile_list")
+                app.storage.client["profile_active_tab"] = "profile_list"
             except Exception as back_error:
                 await _log(
                     f"[profile_menu][back][ОШИБКА] {back_error!r}",
                     type_msg="error",
                 )
                 raise
+
+        async def _sync_back_button(target: str | None) -> None:
+            """Подключаем системную кнопку Назад для внутренних экранов."""
+            try:
+                section_name = (target or "").strip()
+                if section_name in SECTION_RENDERERS:
+                    await back_button.activate(_go_back_to_profile)
+                else:
+                    await back_button.deactivate()
+            except Exception as sync_error:
+                await _log(
+                    f"[profile_menu][back_button] ошибка синхронизации: {sync_error!r}",
+                    type_msg="error",
+                )
+
+        async def _external_back_sync(target: str | None) -> None:
+            """Вызывается извне для принудительной синхронизации кнопки Back."""
+
+            await _sync_back_button(target)
+
+        app.storage.client["profile_back_sync"] = _external_back_sync
+        app.storage.client["profile_active_tab"] = "profile_list"
   
         #================================================================
         # Отрисовка секций профиля
@@ -2105,6 +2133,7 @@ async def profile_menu(
 
                                 user['language'] = new_lang
                                 app.storage.user['lang'] = new_lang
+                                await update_table('users', uid, {'language': new_lang})
                                 await _log(
                                     f"[profile_menu][settings][язык] выбран новый язык: {new_lang}",
                                     type_msg='info',
@@ -2700,8 +2729,10 @@ async def profile_menu(
 
 
         async def _render_section_stub(section: str) -> None:
-            """Рисуем пустую страницу с кнопкой Back."""
+            """Рисуем страницу раздела и синхронизируем кнопку Telegram Back."""
             try:
+                await _sync_back_button(section)
+                app.storage.client["profile_active_tab"] = section
                 root.clear()
                 title_key = SECTION_TITLE_KEYS.get(
                     section, "profile_personal_title"
@@ -2710,14 +2741,10 @@ async def profile_menu(
                     with ui.column().classes("w-full q-mt-md flex-1").style(
                         "display:flex; flex-direction:column; min-height:0;"
                     ):
-                        with ui.row().classes("w-full items-center").style('position: relative;'):
-                            ui.button(
-                                icon="arrow_back",
-                                on_click=_go_back_to_profile,
-                            ).props("color=primary flat")
+                        with ui.row().classes("w-full items-center justify-center q-pb-sm"):
                             ui.label(
                                 lang_dict(title_key, current_lang),
-                            ).classes("text-h6 text-center").style('position:absolute; left:50%; transform:translateX(-50%);')
+                            ).classes("text-h6 text-center")
                         content = (
                             ui.column()
                             .classes('w-full flex-1 q-gutter-y-sm')
@@ -3097,7 +3124,7 @@ async def profile_menu(
                     with ui.column().classes(
                         "w-full gap-3 q-pa-xl items-center justify-center text-center"
                     ):
-                        ui.icon("delete_forever").props("size=72px color=negative")
+                        ui.icon("delete_forever").props("size=36px color=negative")
                         ui.label(
                             lang_dict("profile_delete_success", current_lang),
                         ).classes("text-h6")
@@ -3203,6 +3230,7 @@ async def profile_menu(
             try:
                 value = (event.value or "").strip()
                 active_tab = value
+                app.storage.client["profile_active_tab"] = value or "profile_list"
                 await _log(
                     f"[profile_menu][tab_change] -> {value}",
                     type_msg="info",
@@ -3482,6 +3510,9 @@ async def profile_menu(
             current_lang = lang
             current_role = (user.get("role") or "passenger").lower()
 
+            await _sync_back_button("profile_list")
+            app.storage.client["profile_active_tab"] = "profile_list"
+
             root.clear()
             tabs.clear()
 
@@ -3559,9 +3590,9 @@ async def profile_menu(
                 with ui.column().classes('full-width window-height flex flex-col'):
                     header_card = ui.card().classes('w-full q-mb-sm gap-4')
                     with header_card:
-                        with ui.row().classes("items-center gap-4 wrap w-full"):
+                        with ui.row().classes("w-full justify-center items-center gap-4 wrap"):
                             avatar = ui.avatar().props("size=84").classes(
-                                "profile-avatar items-center "
+                                "profile-avatar items-center justify-center rounded-full self-center"
                             )
                             if avatar_url:
                                 avatar.props("color=transparent text-color=transparent")

@@ -569,6 +569,8 @@ async def render_main_map(
 	uid: int | None,
 	user_lang: str,
 	user_data: dict | None,
+	wrapper_id: str | None = None,
+	container_id: str | None = None,
 ) -> None:
 	"""Рендерит полноэкранную карту Google Maps с отслеживанием позиции."""
 
@@ -683,20 +685,36 @@ async def render_main_map(
 			)
 			_set_client_value(CENTER_BUTTON_STYLE_KEY, True)
 
-		# Контейнер карты заранее резервирует доступную высоту.
-		map_wrapper = ui.element("div").classes(
-			"w-full q-pa-none q-ma-none flex-1 relative overflow-hidden"
-		)
-		map_wrapper.style(
-			"min-height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 0px));"
-			"height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 0px));"
-			"width: 100%;"
-		)
-		with map_wrapper:
-			container_id = f"main-map-{uuid4().hex}"
-			map_canvas = ui.element("div").classes("w-full h-full taxibot-map-canvas")
-			map_canvas.props(f"id={container_id}")
-			map_canvas.style("width: 100%; height: 100%;")
+		container_classes = "w-full h-full taxibot-map-canvas"
+		wrapper_dom_id = wrapper_id
+		container_dom_id = container_id
+
+		if not wrapper_dom_id or not container_dom_id:
+			wrapper_alias = wrapper_dom_id or f"main_map_wrapper_{uid or uuid4().hex}"
+			map_wrapper = ui.element("div").classes(
+				"w-full q-pa-none q-ma-none flex-1 relative overflow-hidden"
+			)
+			map_wrapper.style(
+				"min-height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 0px));"
+				"height: calc(var(--main-app-viewport, 100vh) - var(--main-footer-height, 0px));"
+				"width: 100%;"
+			)
+			map_wrapper.props(f"id={wrapper_alias}")
+			wrapper_dom_id = wrapper_alias
+			with map_wrapper:
+				container_alias = container_dom_id or f"main-map-{uuid4().hex}"
+				map_canvas = ui.element("div").classes(container_classes)
+				map_canvas.props(f"id={container_alias}")
+			container_dom_id = container_alias
+
+		if not container_dom_id:
+			await log_info(
+				"[main_map] не удалось получить DOM-id контейнера карты",
+				type_msg="error",
+				uid=uid,
+			)
+			await _notify_geo_issue("container-missing", fallback, safe_lang, uid)
+			return
 
 		permission_status = await _check_geolocation_permission(uid)
 		if permission_status in {"denied", "unsupported", "timeout"}:
@@ -706,7 +724,9 @@ async def render_main_map(
 		center_button_label = lang_dict("map_button_center", safe_lang)
 
 		init_payload = {
-			"containerId": container_id,
+			"containerId": container_dom_id,
+			"wrapperId": wrapper_dom_id,
+			"containerClass": container_classes,
 			"fallback": {
 				"lat": fallback["lat"],
 				"lng": fallback["lng"],
@@ -752,9 +772,26 @@ async def render_main_map(
 				}}
 				return {{ status: 'gmaps-timeout' }};
 			}}
-			const container = document.getElementById(opts.containerId);
+			let container = document.getElementById(opts.containerId);
+			if (!container && opts.wrapperId) {{
+				const wrapper = document.getElementById(opts.wrapperId);
+				if (wrapper) {{
+					container = document.createElement('div');
+					container.id = opts.containerId;
+					if (opts.containerClass) {{
+						container.className = opts.containerClass;
+					}}
+					wrapper.replaceChildren(container);
+				}}
+			}}
 			if (!container) {{
+				if (typeof emitEvent === 'function') {{
+					emitEvent('main_map_geo_error', {{ code: 'container-missing' }});
+				}}
 				return {{ status: 'container-missing' }};
+			}}
+			if (opts.containerClass) {{
+				container.className = opts.containerClass;
 			}}
 			container.innerHTML = '';
 			if (window.__taxibot_map_state?.themeListener) {{
